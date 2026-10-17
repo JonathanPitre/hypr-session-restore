@@ -7,12 +7,16 @@ use tokio::sync::{Mutex, mpsc};
 
 use crate::config::Config;
 use crate::core::restore::{RestoreEngine, validate_session};
+use crate::core::scheduler::{
+    Delta, SaveReason, SettleState, Tick, WindowStamp, classify, on_tick,
+};
 use crate::core::snapshot::SnapshotEngine;
 use crate::core::stamp::{AutoRestore, AutoRestoreInput, decide_auto_restore};
 use crate::core::state::StateManager;
 use crate::ipc::client::HyprCtl;
 use crate::ipc::event_listener;
 use crate::models::HyprEvent;
+use crate::models::TrackedWindow;
 use crate::resolver::AppResolver;
 
 pub async fn run(config: Config) -> Result<()> {
@@ -37,8 +41,12 @@ pub async fn run(config: Config) -> Result<()> {
         Signals::new([SIGINT, SIGTERM, SIGUSR1]).context("registering signal handlers")?;
 
     let save_interval = Duration::from_secs(config.general.save_interval);
-    let mut save_timer = tokio::time::interval(save_interval);
-    save_timer.tick().await;
+    let mut settle = SettleState {
+        delay: Duration::from_secs(config.general.settle_delay),
+        deadline: None,
+    };
+    let mut prev_stamps: Option<Vec<WindowStamp>> = None;
+    let mut next_wake = std::time::Instant::now() + save_interval;
 
     tracing::info!(
         "daemon running, tracking {} windows, saving every {}s",
@@ -49,31 +57,56 @@ pub async fn run(config: Config) -> Result<()> {
     loop {
         tokio::select! {
             Some(event) = event_rx.recv() => {
-                handle_event(event, &state, &resolver, &ctl).await;
+                let changed = handle_event(event, &state, &resolver, &ctl).await;
+                if changed && settle.deadline.is_some() {
+                    let count = state.lock().await.window_count();
+                    let tick = on_tick(
+                        Delta::Material,
+                        SaveReason::Periodic,
+                        &mut settle,
+                        std::time::Instant::now(),
+                        count,
+                    );
+                    if tick == Tick::Save {
+                        save_with_refresh(&state, &snapshot, &ctl, "event").await;
+                        prev_stamps = Some(current_stamps(&state).await);
+                        next_wake = std::time::Instant::now() + save_interval;
+                    }
+                }
             }
 
-            _ = save_timer.tick() => {
-                save_with_refresh(&state, &snapshot, &ctl, "periodic").await;
+            () = tokio::time::sleep_until(tokio::time::Instant::from_std(next_wake)) => {
+                next_wake = periodic_wake(
+                    &state,
+                    &snapshot,
+                    &ctl,
+                    &mut prev_stamps,
+                    &mut settle,
+                    save_interval,
+                )
+                .await;
             }
 
             Some(sig) = futures::StreamExt::next(&mut signals) => {
-                match sig {
-                    SIGTERM | SIGINT => {
-                        tracing::info!("received signal {sig}, saving and exiting...");
-                        save_with_refresh(&state, &snapshot, &ctl, "final").await;
-                        break;
-                    }
-                    SIGUSR1 => {
-                        tracing::info!("received SIGUSR1, saving session...");
-                        save_with_refresh(&state, &snapshot, &ctl, "manual").await;
-                    }
-                    _ => {}
+                let exiting = matches!(sig, SIGTERM | SIGINT);
+                if exiting {
+                    tracing::info!("received signal {sig}, saving and exiting...");
+                } else if sig == SIGUSR1 {
+                    tracing::info!("received SIGUSR1, saving session...");
+                }
+                if save_for_signal(&state, &snapshot, &ctl, &mut prev_stamps, &mut settle).await {
+                    next_wake = std::time::Instant::now() + save_interval;
+                }
+                if exiting {
+                    break;
                 }
             }
 
             else => {
                 tracing::info!("event stream ended, saving final session...");
-                save_with_refresh(&state, &snapshot, &ctl, "final").await;
+                let saved =
+                    save_for_signal(&state, &snapshot, &ctl, &mut prev_stamps, &mut settle).await;
+                tracing::debug!("final save wrote={saved}");
                 break;
             }
         }
@@ -171,6 +204,85 @@ async fn maybe_auto_restore(
     Ok(())
 }
 
+async fn periodic_wake(
+    state: &Arc<Mutex<StateManager>>,
+    snapshot: &SnapshotEngine,
+    ctl: &HyprCtl,
+    prev_stamps: &mut Option<Vec<WindowStamp>>,
+    settle: &mut SettleState,
+    period: Duration,
+) -> std::time::Instant {
+    let stamps = current_stamps(state).await;
+    let delta = classify(prev_stamps.as_deref(), &stamps);
+    let tick = on_tick(
+        delta,
+        SaveReason::Periodic,
+        settle,
+        std::time::Instant::now(),
+        stamps.len(),
+    );
+    match tick {
+        Tick::Wait(deadline) => {
+            *prev_stamps = Some(stamps);
+            deadline
+        }
+        Tick::Save => {
+            save_with_refresh(state, snapshot, ctl, "periodic").await;
+            *prev_stamps = Some(current_stamps(state).await);
+            std::time::Instant::now() + period
+        }
+        Tick::Idle => {
+            *prev_stamps = Some(stamps);
+            std::time::Instant::now() + period
+        }
+    }
+}
+
+async fn save_for_signal(
+    state: &Arc<Mutex<StateManager>>,
+    snapshot: &SnapshotEngine,
+    ctl: &HyprCtl,
+    prev_stamps: &mut Option<Vec<WindowStamp>>,
+    settle: &mut SettleState,
+) -> bool {
+    let count = state.lock().await.window_count();
+    let tick = on_tick(
+        Delta::Unchanged,
+        SaveReason::Signal,
+        settle,
+        std::time::Instant::now(),
+        count,
+    );
+    if tick != Tick::Save {
+        return false;
+    }
+    save_with_refresh(state, snapshot, ctl, "signal").await;
+    *prev_stamps = Some(current_stamps(state).await);
+    true
+}
+
+async fn current_stamps(state: &Arc<Mutex<StateManager>>) -> Vec<WindowStamp> {
+    state
+        .lock()
+        .await
+        .windows()
+        .into_iter()
+        .map(stamp_window)
+        .collect()
+}
+
+fn stamp_window(window: &TrackedWindow) -> WindowStamp {
+    WindowStamp {
+        address: window.address.clone(),
+        workspace: window.workspace.clone(),
+        monitor: window.monitor.clone(),
+        floating: window.floating,
+        fullscreen: window.fullscreen,
+        position: window.position,
+        size: window.size,
+    }
+}
+
 /// Refresh window geometry from Hyprland and save. Hyprland emits no events
 /// for tiled resize/position changes, so we must re-query before every save
 /// to capture the user's actual layout.
@@ -255,7 +367,7 @@ async fn handle_event(
     state: &Arc<Mutex<StateManager>>,
     resolver: &Arc<AppResolver>,
     ctl: &HyprCtl,
-) {
+) -> bool {
     match event {
         HyprEvent::OpenWindow {
             address,
@@ -269,7 +381,7 @@ async fn handle_event(
             };
 
             if !should_track {
-                return;
+                return false;
             }
 
             let (pid, position, size, floating, fullscreen) =
@@ -295,24 +407,30 @@ async fn handle_event(
                 pid,
                 profile,
             });
+            true
         }
         HyprEvent::CloseWindow { address } => {
             let mut state = state.lock().await;
             state.remove(&address);
+            false
         }
         HyprEvent::MoveWindow { address, workspace } => {
             let mut state = state.lock().await;
             state.update_workspace(&address, &workspace);
+            true
         }
         HyprEvent::ChangeFloatingMode { address, floating } => {
             let mut state = state.lock().await;
             state.update_floating(&address, floating);
+            true
         }
         HyprEvent::Fullscreen { state } => {
             tracing::debug!("fullscreen toggled: {state}");
+            false
         }
         HyprEvent::Unknown(ref raw) => {
             tracing::trace!("unhandled event: {raw}");
+            false
         }
     }
 }
