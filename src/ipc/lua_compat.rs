@@ -26,7 +26,10 @@ pub fn translate_dispatch(args: &str) -> Result<String> {
         // Confirmed: hl.dsp.focus({ window = "address:0x.." })
         "focuswindow" => {
             let selector = parse_address_selector(rest)?;
-            Ok(format!(r#"hl.dsp.focus({{ window = "{selector}" }})"#))
+            Ok(format!(
+                "hl.dsp.focus({{ window = {} }})",
+                lua_quote(selector)
+            ))
         }
         // Confirmed: hl.dsp.window.float({ window = "address:0x.." }) toggles
         // floating state — empirically observed switching a tiled window to
@@ -35,7 +38,8 @@ pub fn translate_dispatch(args: &str) -> Result<String> {
         "setfloating" => {
             let selector = parse_address_selector(rest)?;
             Ok(format!(
-                r#"hl.dsp.window.float({{ window = "{selector}" }})"#
+                "hl.dsp.window.float({{ window = {} }})",
+                lua_quote(selector)
             ))
         }
         // Inferred from the same pattern as focuswindow/setfloating (bare
@@ -44,7 +48,8 @@ pub fn translate_dispatch(args: &str) -> Result<String> {
         "closewindow" => {
             let selector = parse_address_selector(rest)?;
             Ok(format!(
-                r#"hl.dsp.window.close({{ window = "{selector}" }})"#
+                "hl.dsp.window.close({{ window = {} }})",
+                lua_quote(selector)
             ))
         }
         // Confirmed shape (window+x+y+exact fields all verified individually);
@@ -52,15 +57,19 @@ pub fn translate_dispatch(args: &str) -> Result<String> {
         // follows the same pattern as float/resize/move.
         "fullscreen" => {
             let (mode, selector) = split_leading_arg_and_address(rest)?;
+            require_lua_int(mode)?;
             Ok(format!(
-                r#"hl.dsp.window.fullscreen({{ window = "{selector}", mode = {mode} }})"#
+                "hl.dsp.window.fullscreen({{ window = {}, mode = {mode} }})",
+                lua_quote(&selector)
             ))
         }
         // Confirmed: hl.dsp.window.move({ window = .., workspace = ".." })
         "movetoworkspacesilent" => {
             let (ws, selector) = split_leading_arg_and_address(rest)?;
             Ok(format!(
-                r#"hl.dsp.window.move({{ window = "{selector}", workspace = "{ws}" }})"#
+                "hl.dsp.window.move({{ window = {}, workspace = {} }})",
+                lua_quote(&selector),
+                lua_quote(ws)
             ))
         }
         // Confirmed: hl.dsp.window.move({ window = .., x = .., y = .. }) sets
@@ -75,8 +84,11 @@ pub fn translate_dispatch(args: &str) -> Result<String> {
             let (x, y) = xy
                 .split_once(' ')
                 .ok_or_else(|| anyhow!("movewindowpixel: expected `<x> <y>`, got {xy:?}"))?;
+            require_lua_int(x)?;
+            require_lua_int(y)?;
             Ok(format!(
-                r#"hl.dsp.window.move({{ window = "address:{selector}", x = {x}, y = {y} }})"#
+                "hl.dsp.window.move({{ window = {}, x = {x}, y = {y} }})",
+                lua_quote(&format!("address:{selector}"))
             ))
         }
         // Confirmed: hl.dsp.window.resize({ window = .., x = .., y = .., exact = bool })
@@ -90,8 +102,11 @@ pub fn translate_dispatch(args: &str) -> Result<String> {
             let (w, h) = wh
                 .split_once(' ')
                 .ok_or_else(|| anyhow!("resizewindowpixel: expected `<w> <h>`, got {wh:?}"))?;
+            require_lua_int(w)?;
+            require_lua_int(h)?;
             Ok(format!(
-                r#"hl.dsp.window.resize({{ window = "address:{selector}", x = {w}, y = {h}, exact = {exact} }})"#
+                "hl.dsp.window.resize({{ window = {}, x = {w}, y = {h}, exact = {exact} }})",
+                lua_quote(&format!("address:{selector}"))
             ))
         }
         // Structural inference (not independently verified per-message): classic
@@ -106,7 +121,9 @@ pub fn translate_dispatch(args: &str) -> Result<String> {
                 anyhow!("moveworkspacetomonitor: expected `<ws> <monitor>`, got {rest:?}")
             })?;
             Ok(format!(
-                r#"hl.dsp.workspace.move({{ workspace = "{ws}", monitor = "{monitor}" }})"#
+                "hl.dsp.workspace.move({{ workspace = {}, monitor = {} }})",
+                lua_quote(ws),
+                lua_quote(monitor)
             ))
         }
         // Inferred, NOT independently confirmed: `type(hl.dsp.workspace) ==
@@ -120,7 +137,7 @@ pub fn translate_dispatch(args: &str) -> Result<String> {
         // hard-abort the restore via the unguarded `?` at the call site), so
         // attempting it can only do better, never worse. Verify against
         // journalctl on the next real restore.
-        "workspace" => Ok(format!(r#"hl.dsp.workspace("{rest}")"#)),
+        "workspace" => Ok(format!("hl.dsp.workspace({})", lua_quote(rest))),
         // Confirmed shape for the dispatcher name; exec's own argument is a
         // raw shell command, not address-targeted.
         "exec" => Ok(format!("hl.dsp.exec_cmd({})", lua_quote(rest))),
@@ -148,6 +165,14 @@ fn split_leading_arg_and_address(s: &str) -> Result<(&str, String)> {
         bail!("expected `address:0x..` after comma, got {addr:?}");
     }
     Ok((leading, addr.to_string()))
+}
+
+fn require_lua_int(raw: &str) -> Result<()> {
+    let digits = raw.strip_prefix('-').unwrap_or(raw);
+    if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        bail!("lua_compat: expected an integer, got {raw:?}");
+    }
+    Ok(())
 }
 
 /// Lua single-quoted string literal, escaping backslashes/quotes.

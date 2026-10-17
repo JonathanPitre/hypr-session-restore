@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 use tokio::io::AsyncBufReadExt;
@@ -7,6 +7,12 @@ use tokio::task::JoinHandle;
 
 use crate::core::layout::dwindle::{self, DwindlePlan};
 use crate::core::layout::master::{self, MasterPlan};
+use crate::core::quote::posix_single_quote;
+use crate::core::quote::{
+    WorkspaceName, exec_here, exec_on_workspace, focus_window, move_to_workspace_silent,
+    move_workspace_to_monitor, normalize_windowrule_name, shell_join, shell_quote,
+    workspace_switch,
+};
 use crate::core::state::normalize_address;
 use crate::ipc::client::HyprCtl;
 use crate::ipc::event_listener::parse_event;
@@ -233,6 +239,7 @@ impl RestoreEngine {
         ctl: &HyprCtl,
         live_windows: Vec<TrackedWindow>,
     ) -> Result<(RestoreReport, Option<JoinHandle<()>>)> {
+        validate_session(session)?;
         let mut live_pool = LiveWindowPool::new(live_windows);
         let mut report = RestoreReport::default();
         let total = session.windows.len();
@@ -553,7 +560,7 @@ impl RestoreEngine {
                     .await,
             );
 
-            ctl.dispatch(&format!("workspace {ws}")).await?;
+            ctl.dispatch(&workspace_switch(ws)?).await?;
             drop(
                 ctl.dispatch(&format!("layoutmsg orientation{}", plan.orientation))
                     .await,
@@ -814,7 +821,7 @@ impl RestoreEngine {
                         Some((focus_addr.as_str(), presel))
                     } else {
                         if i == 0 {
-                            ctl.dispatch(&format!("workspace {ws}")).await?;
+                            ctl.dispatch(&workspace_switch(ws)?).await?;
                         }
                         None
                     };
@@ -892,12 +899,12 @@ impl RestoreEngine {
         }
 
         let rule_name = format!(
-            "hypr-persist-{}-{}",
-            window.app_id.replace(['.', ' '], "-"),
-            rule_counter
+            "hypr-persist-{}-{rule_counter}",
+            normalize_windowrule_name(&window.app_id)?,
         );
         *rule_counter += 1;
         let class_escaped = regex::escape(&window.app_id);
+        let workspace = WorkspaceName::parse(&window.workspace)?;
 
         ctl.keyword(&format!(
             "windowrule[{rule_name}]:match:class ^({class_escaped})$"
@@ -905,11 +912,11 @@ impl RestoreEngine {
         .await?;
         ctl.keyword(&format!(
             "windowrule[{rule_name}]:workspace {} silent",
-            window.workspace
+            workspace.as_str()
         ))
         .await?;
         let launch_cmd = build_bsp_launch_cmd(window);
-        ctl.dispatch(&format!("exec {launch_cmd}"))
+        ctl.dispatch(&exec_here(&launch_cmd))
             .await
             .with_context(|| format!("launching {}", window.launch_cmd))?;
 
@@ -917,11 +924,8 @@ impl RestoreEngine {
             tracing::debug!("  {} appeared at 0x{addr}", window.app_id);
             disable_all_rules(ctl, &[rule_name]).await;
             drop(
-                ctl.dispatch(&format!(
-                    "movetoworkspacesilent {},address:0x{addr}",
-                    window.workspace
-                ))
-                .await,
+                ctl.dispatch(&move_to_workspace_silent(&window.workspace, addr)?)
+                    .await,
             );
             let final_addr = self
                 .retile_superseding_window(
@@ -1074,7 +1078,10 @@ impl RestoreEngine {
                 let Some(addr) = addresses.get(&step.focus_window_idx) else {
                     continue;
                 };
-                if let Err(e) = ctl.dispatch(&format!("focuswindow address:0x{addr}")).await {
+                let Ok(cmd) = focus_window(addr) else {
+                    continue;
+                };
+                if let Err(e) = ctl.dispatch(&cmd).await {
                     tracing::warn!("splitratio: focus failed: {e}");
                     continue;
                 }
@@ -1469,21 +1476,19 @@ impl RestoreEngine {
                 window.app_id
             );
             drop(
-                ctl.dispatch(&format!(
-                    "movetoworkspacesilent {},address:0x{addr}",
-                    window.workspace
-                ))
-                .await,
+                ctl.dispatch(&move_to_workspace_silent(&window.workspace, &addr)?)
+                    .await,
             );
             return Ok(LaunchOutcome::Adopted(addr));
         }
 
         let rule_name = format!(
             "hypr-persist-{}-{}",
-            window.app_id.replace(['.', ' '], "-"),
+            normalize_windowrule_name(&window.app_id)?,
             active_rules.len()
         );
         let class_escaped = regex::escape(&window.app_id);
+        let workspace = WorkspaceName::parse(&window.workspace)?;
 
         ctl.keyword(&format!(
             "windowrule[{rule_name}]:match:class ^({class_escaped})$"
@@ -1491,17 +1496,14 @@ impl RestoreEngine {
         .await?;
         ctl.keyword(&format!(
             "windowrule[{rule_name}]:workspace {} silent",
-            window.workspace
+            workspace.as_str()
         ))
         .await?;
 
         let launch_cmd = build_launch_cmd(window);
-        ctl.dispatch(&format!(
-            "exec [workspace {} silent] {launch_cmd}",
-            window.workspace
-        ))
-        .await
-        .with_context(|| format!("launching {}", window.launch_cmd))?;
+        ctl.dispatch(&exec_on_workspace(&window.workspace, &launch_cmd)?)
+            .await
+            .with_context(|| format!("launching {}", window.launch_cmd))?;
 
         if let Some(ref addr) = self.wait_for_open_event(events, &window.app_id).await {
             tracing::debug!("  {} appeared at 0x{addr}", window.app_id);
@@ -1515,11 +1517,8 @@ impl RestoreEngine {
             };
 
             drop(
-                ctl.dispatch(&format!(
-                    "movetoworkspacesilent {},address:0x{final_addr}",
-                    window.workspace
-                ))
-                .await,
+                ctl.dispatch(&move_to_workspace_silent(&window.workspace, &final_addr)?)
+                    .await,
             );
             if master_role == MasterRole::Promote {
                 drop(ctl.dispatch("layoutmsg addmaster").await);
@@ -1536,11 +1535,8 @@ impl RestoreEngine {
             );
             disable_all_rules(ctl, &[rule_name]).await;
             drop(
-                ctl.dispatch(&format!(
-                    "movetoworkspacesilent {},address:0x{addr}",
-                    window.workspace
-                ))
-                .await,
+                ctl.dispatch(&move_to_workspace_silent(&window.workspace, &addr)?)
+                    .await,
             );
             Ok(LaunchOutcome::Adopted(addr))
         } else {
@@ -1768,20 +1764,14 @@ async fn place_window_in_bsp_slot(
     workspace: &str,
     anchor: Option<(&str, dwindle::PreselDir)>,
 ) {
-    if ctl
-        .dispatch(&format!(
-            "movetoworkspacesilent {workspace},address:0x{addr}"
-        ))
-        .await
-        .is_ok()
+    if let Ok(cmd) = move_to_workspace_silent(workspace, addr)
+        && ctl.dispatch(&cmd).await.is_ok()
     {
         tracing::debug!("place: move to workspace ok");
     }
 
-    if ctl
-        .dispatch(&format!("focuswindow address:0x{addr}"))
-        .await
-        .is_ok()
+    if let Ok(cmd) = focus_window(addr)
+        && ctl.dispatch(&cmd).await.is_ok()
     {
         tracing::debug!("place: focus ok");
     }
@@ -1794,10 +1784,8 @@ async fn place_window_in_bsp_slot(
     }
 
     if let Some((anchor_addr, presel)) = anchor {
-        if ctl
-            .dispatch(&format!("focuswindow address:0x{anchor_addr}"))
-            .await
-            .is_ok()
+        if let Ok(cmd) = focus_window(anchor_addr)
+            && ctl.dispatch(&cmd).await.is_ok()
         {
             tracing::debug!("place: focus anchor ok");
         }
@@ -1836,23 +1824,15 @@ async fn apply_late_window(
             .await;
         }
         (PlacementHint::MasterPromote, false) => {
-            drop(
-                ctl.dispatch(&format!(
-                    "movetoworkspacesilent {},address:0x{address}",
-                    pw.workspace
-                ))
-                .await,
-            );
+            if let Ok(cmd) = move_to_workspace_silent(&pw.workspace, address) {
+                drop(ctl.dispatch(&cmd).await);
+            }
             drop(ctl.dispatch("layoutmsg addmaster").await);
         }
         _ => {
-            drop(
-                ctl.dispatch(&format!(
-                    "movetoworkspacesilent {},address:0x{address}",
-                    pw.workspace
-                ))
-                .await,
-            );
+            if let Ok(cmd) = move_to_workspace_silent(&pw.workspace, address) {
+                drop(ctl.dispatch(&cmd).await);
+            }
         }
     }
 
@@ -1886,6 +1866,20 @@ async fn apply_late_window(
     }
 }
 
+fn validate_session(session: &SessionFile) -> Result<()> {
+    for window in &session.windows {
+        crate::core::quote::reject_control_bytes(&window.app_id)?;
+        WorkspaceName::parse(&window.workspace)?;
+        if let Some(monitor) = window.monitor.as_deref().filter(|name| !name.is_empty()) {
+            crate::core::quote::MonitorName::parse(monitor)?;
+        }
+        if window.launch_cmd.is_empty() {
+            bail!("empty launch command for '{}'", window.app_id);
+        }
+    }
+    Ok(())
+}
+
 /// Build the exec command, injecting browser profile flags and/or saved CWD.
 ///
 /// Profile flags (e.g. `-P work`, `--profile-directory=Profile 1`) are
@@ -1896,23 +1890,24 @@ async fn apply_late_window(
 /// its own process) and appends `--working-directory=<path>`.
 /// For other apps with CWD: wraps with `cd <path> && exec <cmd>`.
 fn build_launch_cmd(window: &WindowEntry) -> String {
-    let cmd = window.profile.as_ref().map_or_else(
+    let raw = window.profile.as_ref().map_or_else(
         || window.launch_cmd.clone(),
         |profile| format!("{} {profile}", window.launch_cmd),
     );
+    let cmd = shell_join(&raw);
 
     let Some(cwd) = window.cwd.as_deref() else {
         return cmd;
     };
 
-    terminal_cwd_flag(&cmd).map_or_else(
+    terminal_cwd_flag(&raw).map_or_else(
         || {
-            let escaped = shell_escape(cwd);
+            let escaped = posix_single_quote(cwd);
             format!("sh -c 'cd {escaped} && exec {cmd}'")
         },
         |flag| {
             let clean = strip_single_instance_flags(&cmd);
-            format!("{clean} {flag}{cwd}")
+            format!("{clean} {flag}{}", shell_quote(cwd))
         },
     )
 }
@@ -1941,10 +1936,6 @@ fn terminal_cwd_flag(launch_cmd: &str) -> Option<&'static str> {
         .iter()
         .find(|(name, _)| *name == bin)
         .map(|(_, flag)| *flag)
-}
-
-fn shell_escape(s: &str) -> String {
-    format!("'{}'", s.replace('\'', "'\\''"))
 }
 
 /// Before restoring windows, move each workspace to the monitor it was
@@ -1979,13 +1970,9 @@ async fn bind_workspaces_to_monitors(session: &SessionFile, ctl: &HyprCtl) {
             "binding workspace {} to monitor {monitor}",
             window.workspace
         );
-        drop(
-            ctl.dispatch(&format!(
-                "moveworkspacetomonitor {} {monitor}",
-                window.workspace
-            ))
-            .await,
-        );
+        if let Ok(cmd) = move_workspace_to_monitor(&window.workspace, monitor) {
+            drop(ctl.dispatch(&cmd).await);
+        }
         bound += 1;
     }
 
