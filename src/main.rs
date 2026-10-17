@@ -59,6 +59,14 @@ enum Command {
     },
     /// Show current daemon status
     Status,
+    /// Pin a session, or print the current pin
+    Pin {
+        /// Session name to pin. Omit to print the current pin.
+        name: Option<String>,
+        /// Clear the current pin
+        #[arg(long)]
+        clear: bool,
+    },
 }
 
 fn init_logging(verbose: u8, quiet: bool) {
@@ -124,15 +132,19 @@ async fn main() -> Result<()> {
         Some(Command::Status) => {
             cmd_status(&cfg).await?;
         }
+
+        Some(Command::Pin { name, clear }) => {
+            cmd_pin(&cfg, name.as_deref(), clear)?;
+        }
     }
 
     Ok(())
 }
 
 async fn cmd_save(cfg: &config::Config, name: Option<&str>) -> Result<()> {
-    let name = name.unwrap_or("last");
-    let ctl = ipc::client::HyprCtl::from_env()?;
     let snapshot = core::snapshot::SnapshotEngine::new(cfg)?;
+    let name = snapshot.save_target(name)?;
+    let ctl = ipc::client::HyprCtl::from_env()?;
     let resolver = resolver::AppResolver::new(cfg);
     let mut state = core::state::StateManager::new(cfg);
 
@@ -160,24 +172,16 @@ async fn cmd_save(cfg: &config::Config, name: Option<&str>) -> Result<()> {
         });
     }
 
-    let path = snapshot.save(&state, name)?;
+    let path = snapshot.save(&state, &name)?;
     println!("Session '{name}' saved to {}", path.display());
     Ok(())
 }
 
 async fn cmd_restore(cfg: &config::Config, name: Option<&str>) -> Result<()> {
-    let name = name.unwrap_or("last");
-    let ctl = ipc::client::HyprCtl::from_env()?;
     let snapshot = core::snapshot::SnapshotEngine::new(cfg)?;
-
-    if !snapshot.exists(name) {
-        bail!(
-            "session '{name}' not found in {}",
-            snapshot.session_dir().display()
-        );
-    }
-
-    let session = snapshot.load(name)?;
+    let name = snapshot.resolve_restore_target(name)?;
+    let ctl = ipc::client::HyprCtl::from_env()?;
+    let session = snapshot.load(&name)?;
     let engine =
         core::restore::RestoreEngine::new(cfg.general.restore_geometry, cfg.general.restore_layout);
     // No live-window inventory here: this is a one-shot manual restore with
@@ -220,6 +224,28 @@ fn cmd_list(cfg: &config::Config) -> Result<()> {
             );
             println!("{name:<20} {dt:<24}");
         }
+    }
+    Ok(())
+}
+
+fn cmd_pin(cfg: &config::Config, name: Option<&str>, clear: bool) -> Result<()> {
+    if clear && name.is_some() {
+        bail!("pass either a session name or --clear");
+    }
+    let snapshot = core::snapshot::SnapshotEngine::new(cfg)?;
+    if clear {
+        snapshot.clear_pin()?;
+        println!("Pin cleared.");
+        return Ok(());
+    }
+    if let Some(name) = name {
+        snapshot.pin(name)?;
+        println!("Pinned session '{name}'.");
+        return Ok(());
+    }
+    match snapshot.pinned_name()? {
+        Some(name) => println!("{name}"),
+        None => println!("No pinned session."),
     }
     Ok(())
 }

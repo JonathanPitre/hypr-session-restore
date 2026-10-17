@@ -91,7 +91,9 @@ impl PrivateDir {
     /// Atomically replace `leaf` with `bytes`.
     ///
     /// The temporary name is hidden (`.<leaf>.<pid>.<nanos>.tmp`) so directory
-    /// listings that skip dotfiles never observe it. Any failure before
+    /// listings that skip dotfiles never observe it. A leaf that already
+    /// starts with `.` keeps a single leading dot, so the name never contains
+    /// `..`. Any failure before
     /// `renameat` unlinks that temporary.
     pub fn atomic_write(&self, leaf: &str, bytes: &[u8]) -> Result<()> {
         self.atomic_write_inner(leaf, bytes, false)
@@ -355,7 +357,8 @@ fn temp_name(leaf: &str) -> String {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |elapsed| elapsed.as_nanos());
-    format!(".{leaf}.{}.{nanos}.tmp", std::process::id())
+    let body = leaf.strip_prefix('.').unwrap_or(leaf);
+    format!(".{body}.{}.{nanos}.tmp", std::process::id())
 }
 
 fn write_temp(file: &mut File, bytes: &[u8]) -> Result<()> {

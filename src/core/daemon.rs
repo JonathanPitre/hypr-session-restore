@@ -30,27 +30,35 @@ pub async fn run(config: Config) -> Result<()> {
 
     populate_initial_state(&state, &resolver, &ctl).await?;
 
-    if config.general.restore_on_start && snapshot.exists("last") {
-        tracing::info!("waiting for compositor to settle...");
-        wait_for_settle(&mut event_rx).await;
-        tracing::info!("restoring previous session...");
-        match snapshot.load("last") {
-            Ok(session) => {
-                let live_windows: Vec<crate::models::TrackedWindow> =
-                    state.lock().await.windows().into_iter().cloned().collect();
-                let engine = RestoreEngine::new(
-                    config.general.restore_geometry,
-                    config.general.restore_layout,
-                );
-                let (report, _watcher) = engine.restore(&session, &ctl, live_windows).await?;
-                if report.failed > 0 {
-                    for (app, err) in &report.errors {
-                        tracing::warn!("restore failed for {app}: {err}");
+    if config.general.restore_on_start {
+        match snapshot.resolve_restore_target(None) {
+            Ok(name) => {
+                tracing::info!("waiting for compositor to settle...");
+                wait_for_settle(&mut event_rx).await;
+                tracing::info!("restoring session '{name}'...");
+                match snapshot.load(&name) {
+                    Ok(session) => {
+                        let live_windows: Vec<crate::models::TrackedWindow> =
+                            state.lock().await.windows().into_iter().cloned().collect();
+                        let engine = RestoreEngine::new(
+                            config.general.restore_geometry,
+                            config.general.restore_layout,
+                        );
+                        let (report, _watcher) =
+                            engine.restore(&session, &ctl, live_windows).await?;
+                        if report.failed > 0 {
+                            for (app, err) in &report.errors {
+                                tracing::warn!("restore failed for {app}: {err}");
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!("failed to load session '{name}': {e}");
                     }
                 }
             }
             Err(e) => {
-                tracing::warn!("failed to load session 'last': {e}");
+                tracing::debug!("restore-on-start skipped: {e}");
             }
         }
     }
@@ -124,7 +132,14 @@ async fn save_with_refresh(
         Ok(clients) => state.refresh_geometry(&clients, &monitor_map),
         Err(e) => tracing::warn!("{label} save: failed to refresh geometry: {e}"),
     }
-    let save_result = snapshot.save(&state, "last");
+    let target = match snapshot.save_target(None) {
+        Ok(name) => name,
+        Err(e) => {
+            tracing::error!("{label} save failed: {e}");
+            return;
+        }
+    };
+    let save_result = snapshot.save(&state, &target);
     drop(state);
     if let Err(e) = save_result {
         tracing::error!("{label} save failed: {e}");

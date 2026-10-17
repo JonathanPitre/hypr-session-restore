@@ -42,6 +42,12 @@ fn session_leaf(name: &str) -> String {
     format!("{name}.toml")
 }
 
+fn predecessor_leaf(name: &str) -> String {
+    format!(".{name}.toml.prev")
+}
+
+const PIN_LEAF: &str = ".pin";
+
 fn resolve_cwds_for_windows(windows: &[&TrackedWindow]) -> Vec<Option<String>> {
     use std::collections::HashMap;
 
@@ -148,6 +154,7 @@ impl SnapshotEngine {
         }
 
         let leaf = session_leaf(name);
+        self.preserve_predecessor(name)?;
         self.dir
             .atomic_write(&leaf, content.as_bytes())
             .with_context(|| format!("writing session '{name}'"))?;
@@ -178,6 +185,7 @@ impl SnapshotEngine {
     }
 
     pub fn list(&self) -> Result<Vec<(String, i64)>> {
+        let pinned = self.pinned_name().ok().flatten();
         let mut sessions = Vec::new();
 
         let names = self
@@ -200,7 +208,13 @@ impl SnapshotEngine {
                 continue;
             };
             if let Ok(session) = toml::from_str::<SessionFile>(&content) {
-                sessions.push((session.session.name, session.session.timestamp));
+                let raw_name = session.session.name;
+                let label = if pinned.as_deref() == Some(raw_name.as_str()) {
+                    format!("* {raw_name}")
+                } else {
+                    raw_name
+                };
+                sessions.push((label, session.session.timestamp));
             }
         }
 
@@ -210,6 +224,9 @@ impl SnapshotEngine {
 
     pub fn delete(&self, name: &str) -> Result<()> {
         let name = sanitize_session_name(name)?;
+        if self.pinned_name()?.as_deref() == Some(name) {
+            self.clear_pin()?;
+        }
         let leaf = session_leaf(name);
         let path = self.dir.path().join(&leaf);
         if self.dir.exists_regular(&leaf) {
@@ -231,6 +248,79 @@ impl SnapshotEngine {
 
     pub fn session_dir(&self) -> &Path {
         self.dir.path()
+    }
+
+    /// Pin `name`. The session file must already exist.
+    pub fn pin(&self, name: &str) -> Result<()> {
+        let name = sanitize_session_name(name)?;
+        if !self.dir.exists_regular(&session_leaf(name)) {
+            bail!("session '{name}' not found");
+        }
+        self.dir
+            .atomic_write(PIN_LEAF, format!("{name}\n").as_bytes())
+            .context("writing pin")?;
+        Ok(())
+    }
+
+    pub fn clear_pin(&self) -> Result<()> {
+        self.dir.unlink(PIN_LEAF).context("clearing pin")
+    }
+
+    pub fn pinned_name(&self) -> Result<Option<String>> {
+        let Some(bytes) = self.dir.read_regular(PIN_LEAF)? else {
+            return Ok(None);
+        };
+        let text = String::from_utf8(bytes).context("pin file is not utf-8")?;
+        let name = text.strip_suffix('\n').unwrap_or(&text);
+        if name.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(sanitize_session_name(name)?.to_string()))
+    }
+
+    /// `Some(name)` must exist. `None` is the pin, or the newest session.
+    pub fn resolve_restore_target(&self, explicit: Option<&str>) -> Result<String> {
+        if let Some(name) = explicit {
+            let name = sanitize_session_name(name)?;
+            if !self.exists(name) {
+                bail!(
+                    "session '{name}' not found in {}",
+                    self.dir.path().display()
+                );
+            }
+            return Ok(name.to_string());
+        }
+        if let Some(name) = self.pinned_name()? {
+            if !self.exists(&name) {
+                bail!("pinned session '{name}' not found");
+            }
+            return Ok(name);
+        }
+        self.list()?
+            .into_iter()
+            .next()
+            .map(|(name, _)| name)
+            .context("no saved session")
+    }
+
+    /// `Some(name)` is returned unchanged and does not touch the pin.
+    /// `None` is the pinned session, or `"last"`.
+    pub fn save_target(&self, explicit: Option<&str>) -> Result<String> {
+        if let Some(name) = explicit {
+            return Ok(name.to_string());
+        }
+        Ok(self.pinned_name()?.unwrap_or_else(|| "last".to_string()))
+    }
+
+    fn preserve_predecessor(&self, name: &str) -> Result<()> {
+        let leaf = session_leaf(name);
+        let Some(bytes) = self.dir.read_regular(&leaf)? else {
+            return Ok(());
+        };
+        self.dir
+            .atomic_write(&predecessor_leaf(name), &bytes)
+            .with_context(|| format!("writing predecessor for '{name}'"))?;
+        Ok(())
     }
 
     #[cfg(test)]
@@ -705,5 +795,88 @@ mod tests {
         assert!(engine.save(&state, "semi;colon").is_err());
         assert!(engine.save(&state, "tab\there").is_err());
         assert!(engine.save(&state, ".hidden").is_err());
+    }
+
+    #[test]
+    fn second_save_keeps_predecessor_and_list_length() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = SnapshotEngine::new_with_dir(dir.path(), true).unwrap();
+        let first = make_state_with_windows(vec![("0xa", "firefox", "1", false)]);
+        engine.save(&first, "work").unwrap();
+        let original = engine.dir.read_regular("work.toml").unwrap().unwrap();
+
+        let second = make_state_with_windows(vec![
+            ("0xa", "firefox", "1", false),
+            ("0xb", "code", "2", false),
+        ]);
+        engine.save(&second, "work").unwrap();
+
+        let prev = engine.dir.read_regular(".work.toml.prev").unwrap().unwrap();
+        assert_eq!(prev, original);
+        assert_eq!(engine.load("work").unwrap().windows.len(), 2);
+        let listed = engine.list().unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].0, "work");
+    }
+
+    #[test]
+    fn pin_roundtrip_marks_list_and_delete_unpins() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = SnapshotEngine::new_with_dir(dir.path(), false).unwrap();
+        let state = make_state_with_windows(vec![("0xa", "firefox", "1", false)]);
+        engine.save(&state, "work").unwrap();
+
+        assert!(engine.pinned_name().unwrap().is_none());
+        assert!(engine.pin("missing").is_err());
+        engine.pin("work").unwrap();
+        assert_eq!(engine.pinned_name().unwrap().as_deref(), Some("work"));
+        assert_eq!(engine.list().unwrap()[0].0, "* work");
+
+        engine.delete("work").unwrap();
+        assert!(!engine.exists("work"));
+        assert!(engine.pinned_name().unwrap().is_none());
+    }
+
+    #[test]
+    fn resolve_prefers_pin_over_newer_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = SnapshotEngine::new_with_dir(dir.path(), false).unwrap();
+        std::fs::write(
+            dir.path().join("oldpin.toml"),
+            "[session]\nname = \"oldpin\"\ntimestamp = 1000\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("newer.toml"),
+            "[session]\nname = \"newer\"\ntimestamp = 9000\n",
+        )
+        .unwrap();
+
+        engine.pin("oldpin").unwrap();
+        assert_eq!(engine.resolve_restore_target(None).unwrap(), "oldpin");
+        engine.clear_pin().unwrap();
+        assert_eq!(engine.resolve_restore_target(None).unwrap(), "newer");
+        assert_eq!(
+            engine.resolve_restore_target(Some("oldpin")).unwrap(),
+            "oldpin"
+        );
+        assert!(engine.resolve_restore_target(Some("missing")).is_err());
+    }
+
+    #[test]
+    fn save_target_uses_pin_only_when_unnamed() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = SnapshotEngine::new_with_dir(dir.path(), false).unwrap();
+        let state = make_state_with_windows(vec![("0xa", "firefox", "1", false)]);
+        engine.save(&state, "work").unwrap();
+
+        assert_eq!(engine.save_target(None).unwrap(), "last");
+        assert_eq!(engine.save_target(Some("custom")).unwrap(), "custom");
+        assert!(engine.pinned_name().unwrap().is_none());
+
+        engine.pin("work").unwrap();
+        assert_eq!(engine.save_target(None).unwrap(), "work");
+        assert_eq!(engine.save_target(Some("other")).unwrap(), "other");
+        assert_eq!(engine.pinned_name().unwrap().as_deref(), Some("work"));
     }
 }
