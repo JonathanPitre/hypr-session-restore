@@ -379,6 +379,7 @@ dependencies = [
  "clap",
  "dirs",
  "futures",
+ "libc",
  "regex",
  "serde",
  "serde_json",
