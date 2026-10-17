@@ -1866,7 +1866,7 @@ async fn apply_late_window(
     }
 }
 
-fn validate_session(session: &SessionFile) -> Result<()> {
+pub fn validate_session(session: &SessionFile) -> Result<()> {
     for window in &session.windows {
         crate::core::quote::reject_control_bytes(&window.app_id)?;
         WorkspaceName::parse(&window.workspace)?;

@@ -6,8 +6,9 @@ use std::time::Duration;
 use tokio::sync::{Mutex, mpsc};
 
 use crate::config::Config;
-use crate::core::restore::RestoreEngine;
+use crate::core::restore::{RestoreEngine, validate_session};
 use crate::core::snapshot::SnapshotEngine;
+use crate::core::stamp::{AutoRestore, AutoRestoreInput, decide_auto_restore};
 use crate::core::state::StateManager;
 use crate::ipc::client::HyprCtl;
 use crate::ipc::event_listener;
@@ -30,38 +31,7 @@ pub async fn run(config: Config) -> Result<()> {
 
     populate_initial_state(&state, &resolver, &ctl).await?;
 
-    if config.general.restore_on_start {
-        match snapshot.resolve_restore_target(None) {
-            Ok(name) => {
-                tracing::info!("waiting for compositor to settle...");
-                wait_for_settle(&mut event_rx).await;
-                tracing::info!("restoring session '{name}'...");
-                match snapshot.load(&name) {
-                    Ok(session) => {
-                        let live_windows: Vec<crate::models::TrackedWindow> =
-                            state.lock().await.windows().into_iter().cloned().collect();
-                        let engine = RestoreEngine::new(
-                            config.general.restore_geometry,
-                            config.general.restore_layout,
-                        );
-                        let (report, _watcher) =
-                            engine.restore(&session, &ctl, live_windows).await?;
-                        if report.failed > 0 {
-                            for (app, err) in &report.errors {
-                                tracing::warn!("restore failed for {app}: {err}");
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        tracing::warn!("failed to load session '{name}': {e}");
-                    }
-                }
-            }
-            Err(e) => {
-                tracing::debug!("restore-on-start skipped: {e}");
-            }
-        }
-    }
+    maybe_auto_restore(&config, &snapshot, &state, &ctl, &mut event_rx).await?;
 
     let mut signals =
         Signals::new([SIGINT, SIGTERM, SIGUSR1]).context("registering signal handlers")?;
@@ -111,6 +81,93 @@ pub async fn run(config: Config) -> Result<()> {
 
     event_handle.abort();
     tracing::info!("daemon stopped");
+    Ok(())
+}
+
+async fn maybe_auto_restore(
+    config: &Config,
+    snapshot: &SnapshotEngine,
+    state: &Arc<Mutex<StateManager>>,
+    ctl: &HyprCtl,
+    event_rx: &mut mpsc::Receiver<HyprEvent>,
+) -> Result<()> {
+    let preexisting = if config.general.restore_on_start {
+        ctl.get_clients()
+            .await
+            .map(|clients| clients.len())
+            .unwrap_or(0)
+    } else {
+        0
+    };
+    let loaded = if config.general.restore_on_start {
+        match snapshot.resolve_restore_target(None) {
+            Ok(name) => match snapshot.load(&name) {
+                Ok(session) => Some((name, session)),
+                Err(err) => {
+                    tracing::warn!("failed to load restore target: {err}");
+                    None
+                }
+            },
+            Err(err) => {
+                tracing::debug!("no restore target: {err}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let runtime = std::env::var_os("XDG_RUNTIME_DIR").map(std::path::PathBuf::from);
+    let signature = std::env::var("HYPRLAND_INSTANCE_SIGNATURE").ok();
+    let boot_id = std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
+        .ok()
+        .map(|text| text.trim().to_string());
+    let decision = decide_auto_restore(&AutoRestoreInput {
+        restore_on_start: config.general.restore_on_start,
+        state_root: &config.state_root(),
+        runtime_dir: runtime.as_deref(),
+        signature: signature.as_deref(),
+        boot_id: boot_id.as_deref(),
+        preexisting_windows: preexisting,
+        max_preexisting_windows: config.general.max_preexisting_windows,
+        target: loaded
+            .as_ref()
+            .map(|(name, session)| (name.as_str(), session)),
+    });
+    let AutoRestore::Schedule(plan) = decision else {
+        let AutoRestore::Skip(reason) = decision else {
+            return Ok(());
+        };
+        tracing::info!("auto-restore skipped: {reason:?}");
+        return Ok(());
+    };
+    if let Err(err) = validate_session(&plan.session) {
+        tracing::warn!("auto-restore skipped, session rejected: {err}");
+        return Ok(());
+    }
+    tracing::info!("waiting for compositor to settle...");
+    wait_for_settle(event_rx).await;
+    if let Err(reason) = plan.burn() {
+        tracing::warn!("auto-restore skipped: {reason:?}");
+        return Ok(());
+    }
+    tracing::info!(
+        "stamped instance {} at {}",
+        plan.instance.as_str(),
+        plan.stamp_path().display()
+    );
+    tracing::info!("restoring session '{}'...", plan.name);
+    let live_windows: Vec<crate::models::TrackedWindow> =
+        state.lock().await.windows().into_iter().cloned().collect();
+    let engine = RestoreEngine::new(
+        config.general.restore_geometry,
+        config.general.restore_layout,
+    );
+    let (report, _watcher) = engine.restore(&plan.session, ctl, live_windows).await?;
+    if report.failed > 0 {
+        for (app, err) in &report.errors {
+            tracing::warn!("restore failed for {app}: {err}");
+        }
+    }
     Ok(())
 }
 

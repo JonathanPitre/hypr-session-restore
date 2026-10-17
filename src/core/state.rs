@@ -175,6 +175,9 @@ mod tests {
                 per_window_launch: false,
                 restore_geometry: false,
                 restore_layout: true,
+                settle_delay: 10,
+                max_preexisting_windows: 3,
+                notify: true,
             },
             rules: RulesConfig {
                 exclude: exclude.into_iter().map(String::from).collect(),

@@ -30,6 +30,12 @@ pub struct GeneralConfig {
     pub restore_geometry: bool,
     #[serde(default = "default_true")]
     pub restore_layout: bool,
+    #[serde(default = "default_settle_delay")]
+    pub settle_delay: u64,
+    #[serde(default = "default_max_preexisting_windows")]
+    pub max_preexisting_windows: u32,
+    #[serde(default = "default_true")]
+    pub notify: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -64,6 +70,14 @@ const fn default_true() -> bool {
     true
 }
 
+const fn default_settle_delay() -> u64 {
+    10
+}
+
+const fn default_max_preexisting_windows() -> u32 {
+    3
+}
+
 fn default_excludes() -> Vec<String> {
     vec![
         r"^xdg-desktop-portal.*".to_string(),
@@ -80,6 +94,9 @@ impl Config {
             per_window_launch: true,
             restore_geometry: true,
             restore_layout: true,
+            settle_delay: default_settle_delay(),
+            max_preexisting_windows: default_max_preexisting_windows(),
+            notify: true,
         }
     }
 
@@ -105,16 +122,20 @@ impl Config {
             .join("hypr-persist.toml")
     }
 
-    pub fn session_dir(&self) -> PathBuf {
+    /// Configured state directory, before the `sessions` subdirectory.
+    pub fn state_root(&self) -> PathBuf {
         let raw = &self.general.session_dir;
-        let expanded = raw.strip_prefix('~').map_or_else(
+        raw.strip_prefix('~').map_or_else(
             || PathBuf::from(raw),
             |rest| {
                 let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/tmp"));
                 home.join(rest.strip_prefix('/').unwrap_or(rest))
             },
-        );
-        expanded.join("sessions")
+        )
+    }
+
+    pub fn session_dir(&self) -> PathBuf {
+        self.state_root().join("sessions")
     }
 }
 
@@ -141,6 +162,9 @@ mod tests {
         assert!(cfg.general.per_window_launch);
         assert!(cfg.general.restore_geometry);
         assert!(cfg.general.restore_layout);
+        assert_eq!(cfg.general.settle_delay, 10);
+        assert_eq!(cfg.general.max_preexisting_windows, 3);
+        assert!(cfg.general.notify);
         assert!(!cfg.rules.exclude.is_empty());
         assert!(cfg.rules.include.is_empty());
         assert!(cfg.overrides.is_empty());
