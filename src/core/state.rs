@@ -7,6 +7,7 @@ use crate::models::{HyprClient, TrackedWindow};
 
 pub struct StateManager {
     windows: HashMap<String, TrackedWindow>,
+    pending_opens: HashMap<String, String>,
     exclude_patterns: Vec<Regex>,
     include_patterns: Vec<Regex>,
 }
@@ -45,6 +46,7 @@ impl StateManager {
 
         Self {
             windows: HashMap::new(),
+            pending_opens: HashMap::new(),
             exclude_patterns,
             include_patterns,
         }
@@ -76,11 +78,27 @@ impl StateManager {
             window.workspace
         );
         let key = normalize_address(&window.address);
+        self.pending_opens.remove(&key);
         self.windows.insert(key, window);
+    }
+
+    pub fn defer_open(&mut self, address: &str, class: String) {
+        self.pending_opens.insert(normalize_address(address), class);
+    }
+
+    pub fn pending_class(&self, address: &str) -> Option<&str> {
+        self.pending_opens
+            .get(&normalize_address(address))
+            .map(String::as_str)
+    }
+
+    pub fn has_pending_opens(&self) -> bool {
+        !self.pending_opens.is_empty()
     }
 
     pub fn remove(&mut self, address: &str) -> Option<TrackedWindow> {
         let key = normalize_address(address);
+        self.pending_opens.remove(&key);
         let w = self.windows.remove(&key);
         if let Some(ref w) = w {
             tracing::debug!("untracked: {} ({})", w.app_id, address);

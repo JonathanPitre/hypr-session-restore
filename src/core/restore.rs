@@ -47,6 +47,7 @@ const SINGLE_INSTANCE_FLAGS: &[&str] = &["--gtk-single-instance=true", "--single
 /// A window that was launched but didn't appear within the per-window timeout.
 /// Handed off to the background watcher for deferred placement.
 struct PendingWindow {
+    monitor: Option<String>,
     app_id: String,
     workspace: String,
     floating: bool,
@@ -308,6 +309,8 @@ impl RestoreEngine {
             drop(ctl.keyword("misc:focus_on_activate true").await);
         }
         listener.abort();
+
+        bind_workspaces_to_monitors(session, ctl).await;
 
         tracing::info!(
             "restore complete: {}/{total} apps ({} failed, {} pending)",
@@ -958,6 +961,7 @@ impl RestoreEngine {
             );
             active_rules.push(rule_name.clone());
             pending.push(PendingWindow {
+                monitor: window.monitor.clone(),
                 app_id: window.app_id.clone(),
                 workspace: window.workspace.clone(),
                 floating: window.floating,
@@ -1547,6 +1551,7 @@ impl RestoreEngine {
             );
             active_rules.push(rule_name.clone());
             pending.push(PendingWindow {
+                monitor: window.monitor.clone(),
                 app_id: window.app_id.clone(),
                 workspace: window.workspace.clone(),
                 floating: window.floating,
@@ -1836,6 +1841,16 @@ async fn apply_late_window(
         }
     }
 
+    if let Some(monitor) = &pw.monitor
+        && ctl
+            .get_monitors()
+            .await
+            .is_ok_and(|monitors| monitors.iter().any(|m| &m.name == monitor))
+        && let Ok(cmd) = move_workspace_to_monitor(&pw.workspace, monitor)
+    {
+        drop(ctl.dispatch(&cmd).await);
+    }
+
     if restore_geometry
         && pw.floating
         && let (Some((x, y)), Some((w, h))) = (pw.position, pw.size)
@@ -1968,8 +1983,7 @@ fn terminal_flag(argv0: &str) -> Option<&'static str> {
         .map(|(_, flag)| *flag)
 }
 
-/// Before restoring windows, move each workspace to the monitor it was
-/// originally saved on. Only binds to monitors that are currently connected;
+/// Move populated workspaces to their saved monitors when connected.
 /// workspaces targeting unavailable monitors get default Hyprland placement
 /// (typically the first available monitor).
 async fn bind_workspaces_to_monitors(session: &SessionFile, ctl: &HyprCtl) {
@@ -2098,6 +2112,8 @@ mod tests {
                     log.lock().await.push(buf.clone());
                     let response = if buf.contains("j/clients") {
                         clients_json.lock().await.clone()
+                    } else if buf == "j/monitors" {
+                        r#"[{"id":0,"name":"DP-1"}]"#.to_string()
                     } else {
                         "ok".to_string()
                     };
@@ -2424,6 +2440,7 @@ mod tests {
 
         let paths = HyprSocketPaths::new(sock1, sock2);
         let pending = vec![PendingWindow {
+            monitor: Some("DP-1".to_string()),
             app_id: "slow-app".to_string(),
             workspace: "3".to_string(),
             floating: false,
@@ -2444,6 +2461,13 @@ mod tests {
         assert!(
             has_move,
             "expected movetoworkspacesilent dispatch, got: {commands:?}"
+        );
+
+        assert!(
+            commands
+                .iter()
+                .any(|c| c.contains("moveworkspacetomonitor 3 DP-1")),
+            "late workspace missed its saved monitor: {commands:?}"
         );
 
         let has_rule_disable = commands
@@ -2480,6 +2504,7 @@ mod tests {
 
         let paths = HyprSocketPaths::new(sock1, sock2);
         let pending = vec![PendingWindow {
+            monitor: None,
             app_id: "slack".to_string(),
             workspace: "4".to_string(),
             floating: false,
@@ -2552,6 +2577,7 @@ mod tests {
 
         let paths = HyprSocketPaths::new(sock1, sock2);
         let pending = vec![PendingWindow {
+            monitor: None,
             app_id: "thunar".to_string(),
             workspace: "4".to_string(),
             floating: false,
@@ -2604,6 +2630,7 @@ mod tests {
 
         let paths = HyprSocketPaths::new(sock1, sock2);
         let pending = vec![PendingWindow {
+            monitor: None,
             app_id: "kitty".to_string(),
             workspace: "4".to_string(),
             floating: false,
@@ -2655,6 +2682,7 @@ mod tests {
 
         let paths = HyprSocketPaths::new(sock1, sock2);
         let pending = vec![PendingWindow {
+            monitor: None,
             app_id: "missing-app".to_string(),
             workspace: "2".to_string(),
             floating: false,
@@ -2716,6 +2744,7 @@ mod tests {
 
         let paths = HyprSocketPaths::new(sock1, sock2);
         let pending = vec![PendingWindow {
+            monitor: None,
             app_id: "floater".to_string(),
             workspace: "5".to_string(),
             floating: true,
@@ -2783,6 +2812,7 @@ mod tests {
         let paths = HyprSocketPaths::new(sock1, sock2);
         let pending = vec![
             PendingWindow {
+                monitor: None,
                 app_id: "app-a".to_string(),
                 workspace: "1".to_string(),
                 floating: false,
@@ -2793,6 +2823,7 @@ mod tests {
                 placement: PlacementHint::None,
             },
             PendingWindow {
+                monitor: None,
                 app_id: "app-b".to_string(),
                 workspace: "4".to_string(),
                 floating: false,

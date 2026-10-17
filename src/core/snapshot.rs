@@ -117,24 +117,7 @@ impl SnapshotEngine {
         if count > MAX_WINDOWS {
             bail!("refusing to save {count} windows (limit is {MAX_WINDOWS})");
         }
-        let windows = state.windows();
-
-        let eligible: Vec<&TrackedWindow> = if self.per_window_launch {
-            windows
-                .iter()
-                .copied()
-                .filter(|w| !w.launch_cmd.is_empty())
-                .collect()
-        } else {
-            let mut seen = std::collections::HashSet::new();
-            windows
-                .iter()
-                .copied()
-                .filter(|w| {
-                    !w.launch_cmd.is_empty() && seen.insert((w.app_id.clone(), w.profile.clone()))
-                })
-                .collect()
-        };
+        let eligible = self.capture_windows(state);
 
         let cwds = resolve_cwds_for_windows(&eligible);
         let entries: Vec<WindowEntry> = eligible
@@ -172,6 +155,18 @@ impl SnapshotEngine {
         );
 
         Ok(final_path)
+    }
+
+    pub fn capture_windows<'a>(&self, state: &'a StateManager) -> Vec<&'a TrackedWindow> {
+        let mut seen = std::collections::HashSet::new();
+        state
+            .windows()
+            .into_iter()
+            .filter(|w| {
+                !w.launch_cmd.is_empty()
+                    && (self.per_window_launch || seen.insert((&w.app_id, &w.profile)))
+            })
+            .collect()
     }
 
     pub fn load(&self, name: &str) -> Result<SessionFile> {
