@@ -23,6 +23,12 @@ pub struct PrivateDir {
     readonly: bool,
 }
 
+#[derive(Debug)]
+pub enum ExclusiveError {
+    Exists,
+    Failed(anyhow::Error),
+}
+
 impl PrivateDir {
     /// Open `path` as a private directory owned by the effective uid.
     ///
@@ -97,6 +103,62 @@ impl PrivateDir {
     /// `renameat` unlinks that temporary.
     pub fn atomic_write(&self, leaf: &str, bytes: &[u8]) -> Result<()> {
         self.atomic_write_inner(leaf, bytes, false)
+    }
+
+    /// Create `leaf` only when that name is absent, then write `bytes`.
+    ///
+    /// `O_CREAT|O_EXCL|O_NOFOLLOW` claims the directory entry. An existing
+    /// name, including a symlink, is left untouched. The new fd is `fchmod`'d
+    /// to `0600` by [`write_temp`], so the mode does not follow the umask. A
+    /// crash after the create and before the write can leave an empty file;
+    /// presence is the claim.
+    pub fn create_exclusive(
+        &self,
+        leaf: &str,
+        bytes: &[u8],
+    ) -> std::result::Result<(), ExclusiveError> {
+        if self.readonly {
+            return Err(ExclusiveError::Failed(anyhow::Error::msg(format!(
+                "directory {} is read-only",
+                self.path.display()
+            ))));
+        }
+        validate_leaf(leaf).map_err(ExclusiveError::Failed)?;
+        if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > MAX_SNAPSHOT_BYTES {
+            return Err(ExclusiveError::Failed(anyhow::Error::msg(format!(
+                "refusing to write {leaf}: exceeds {MAX_SNAPSHOT_BYTES} bytes"
+            ))));
+        }
+        let mut file = self.open_exclusive(leaf)?;
+        write_temp(&mut file, bytes).map_err(ExclusiveError::Failed)?;
+        drop(file);
+        self.file.sync_all().map_err(|err| {
+            ExclusiveError::Failed(anyhow::Error::msg(format!(
+                "syncing directory {}: {err}",
+                self.path.display()
+            )))
+        })?;
+        Ok(())
+    }
+
+    fn open_exclusive(&self, leaf: &str) -> std::result::Result<File, ExclusiveError> {
+        let leaf_c = cstring_bytes(leaf.as_bytes()).map_err(ExclusiveError::Failed)?;
+        let flags =
+            libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_WRONLY;
+        // SAFETY: `leaf_c` is a single path component and `dir_fd` refers to
+        // the opened directory. `O_NOFOLLOW|O_EXCL` refuses a pre-existing name.
+        let fd = unsafe { libc::openat(self.dir_fd(), leaf_c.as_ptr(), flags, 0o600) };
+        if fd < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.raw_os_error() == Some(libc::EEXIST) {
+                return Err(ExclusiveError::Exists);
+            }
+            return Err(ExclusiveError::Failed(anyhow::Error::msg(format!(
+                "creating {leaf}: {err}"
+            ))));
+        }
+        // SAFETY: `fd` is a freshly created descriptor owned exclusively here.
+        Ok(unsafe { File::from_raw_fd(fd) })
     }
 
     #[cfg(test)]
@@ -511,5 +573,23 @@ mod tests {
         let names = store.list_names().unwrap();
         assert!(names.iter().all(|name| !name.contains(".tmp")), "{names:?}");
         assert!(names.contains(&"session.toml".to_string()));
+    }
+
+    #[test]
+    fn create_exclusive_refuses_to_replace_or_follow_symlink() {
+        let (parent, store) = writable_dir();
+        let outside = parent.path().join("outside");
+        std::fs::write(&outside, b"secret").unwrap();
+        symlink(&outside, store.path().join("leaf")).unwrap();
+        assert!(store.create_exclusive("leaf", b"new").is_err());
+        assert_eq!(std::fs::read(&outside).unwrap(), b"secret");
+
+        store.create_exclusive("note", b"first").unwrap();
+        assert!(matches!(
+            store.create_exclusive("note", b"second"),
+            Err(ExclusiveError::Exists)
+        ));
+        assert_eq!(store.read_regular("note").unwrap().unwrap(), b"first");
+        assert_eq!(mode_of(&store.path().join("note")), 0o600);
     }
 }

@@ -177,8 +177,6 @@ async fn maybe_auto_restore(
         tracing::warn!("auto-restore skipped, session rejected: {err}");
         return Ok(());
     }
-    tracing::info!("waiting for compositor to settle...");
-    wait_for_settle(event_rx).await;
     if let Err(reason) = plan.burn() {
         tracing::warn!("auto-restore skipped: {reason:?}");
         return Ok(());
@@ -188,6 +186,8 @@ async fn maybe_auto_restore(
         plan.instance.as_str(),
         plan.stamp_path().display()
     );
+    tracing::info!("waiting for compositor to settle...");
+    wait_for_settle(event_rx).await;
     tracing::info!("restoring session '{}'...", plan.name);
     let live_windows: Vec<crate::models::TrackedWindow> =
         state.lock().await.windows().into_iter().cloned().collect();

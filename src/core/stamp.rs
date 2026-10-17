@@ -6,7 +6,7 @@
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::core::store::PrivateDir;
+use crate::core::store::{ExclusiveError, PrivateDir};
 use crate::models::SessionFile;
 
 const MAX_INSTANCE_KEY_LEN: usize = 200;
@@ -54,14 +54,21 @@ pub struct ScheduledRestore {
 }
 
 impl ScheduledRestore {
+    /// Claim this instance's stamp. An existing leaf, even an empty one left
+    /// by a crash, is [`SkipReason::AlreadyStamped`] and is not replaced.
     pub fn burn(&self) -> Result<(), SkipReason> {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_or(0, |elapsed| elapsed.as_secs());
         let body = format!("v1\n{}\n{now}\n", self.name);
-        self.dir
-            .atomic_write(&self.leaf, body.as_bytes())
-            .map_err(|_| SkipReason::StampUnwritable)
+        match self.dir.create_exclusive(&self.leaf, body.as_bytes()) {
+            Ok(()) => Ok(()),
+            Err(ExclusiveError::Exists) => Err(SkipReason::AlreadyStamped),
+            Err(ExclusiveError::Failed(err)) => {
+                tracing::warn!("could not claim restore stamp: {err:#}");
+                Err(SkipReason::StampUnwritable)
+            }
+        }
     }
 
     pub fn stamp_path(&self) -> PathBuf {
@@ -351,6 +358,32 @@ mod tests {
             matches_skip(&decide_auto_restore(&decided)),
             Some(SkipReason::AlreadyStamped)
         );
+    }
+
+    #[test]
+    fn second_burn_does_not_replace_an_existing_stamp() {
+        let root = tempfile::tempdir().unwrap();
+        let runtime = tempfile::tempdir().unwrap();
+        let session = session();
+        let decided = input(root.path(), Some(runtime.path()), Some(("last", &session)));
+        let first = expect_schedule(decide_auto_restore(&decided));
+        let second = expect_schedule(decide_auto_restore(&decided));
+        first.burn().unwrap();
+        std::fs::write(first.stamp_path(), b"sentinel").unwrap();
+        assert_eq!(second.burn(), Err(SkipReason::AlreadyStamped));
+        assert_eq!(std::fs::read(second.stamp_path()).unwrap(), b"sentinel");
+    }
+
+    #[test]
+    fn empty_stamp_is_already_claimed() {
+        let root = tempfile::tempdir().unwrap();
+        let runtime = tempfile::tempdir().unwrap();
+        let session = session();
+        let decided = input(root.path(), Some(runtime.path()), Some(("last", &session)));
+        let plan = expect_schedule(decide_auto_restore(&decided));
+        std::fs::write(plan.stamp_path(), b"").unwrap();
+        assert_eq!(plan.burn(), Err(SkipReason::AlreadyStamped));
+        assert_eq!(std::fs::read(plan.stamp_path()).unwrap(), b"");
     }
 
     #[test]
