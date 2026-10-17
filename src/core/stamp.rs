@@ -130,6 +130,40 @@ pub fn decide_auto_restore(input: &AutoRestoreInput<'_>) -> AutoRestore {
     })
 }
 
+pub struct ObservedStamp {
+    pub session: String,
+    pub instance: String,
+}
+
+/// Read this instance's stamp without creating or repairing the runtime dir.
+pub fn observed_stamp(
+    runtime_dir: Option<&Path>,
+    signature: Option<&str>,
+    boot_id: Option<&str>,
+) -> Option<ObservedStamp> {
+    let runtime = runtime_dir?;
+    if !runtime.is_dir() {
+        return None;
+    }
+    let key = instance_key(signature, boot_id).ok()?;
+    let dir = PrivateDir::open(&runtime.join("hypr-persist"), true).ok()?;
+    let leaf = format!(".{}.stamp", key.as_str());
+    let bytes = dir.read_regular(&leaf).ok()??;
+    let text = String::from_utf8(bytes).ok()?;
+    let mut lines = text.lines();
+    if lines.next()? != "v1" {
+        return None;
+    }
+    let session = lines.next()?.to_string();
+    if session.is_empty() {
+        return None;
+    }
+    Some(ObservedStamp {
+        session,
+        instance: key.as_str().to_string(),
+    })
+}
+
 fn instance_key(signature: Option<&str>, boot_id: Option<&str>) -> Result<InstanceKey, ()> {
     for candidate in [signature, boot_id].into_iter().flatten() {
         if let Ok(key) = InstanceKey::parse(candidate.trim()) {
@@ -139,7 +173,7 @@ fn instance_key(signature: Option<&str>, boot_id: Option<&str>) -> Result<Instan
     Err(())
 }
 
-fn is_disabled(state_root: &Path) -> bool {
+pub fn is_disabled(state_root: &Path) -> bool {
     matches!(
         std::fs::symlink_metadata(state_root.join("disabled")),
         Ok(meta) if meta.file_type().is_symlink() || meta.is_file()

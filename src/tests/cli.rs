@@ -4,6 +4,7 @@
 /// Commands that need Hyprland are expected to fail gracefully.
 #[cfg(test)]
 mod tests {
+    use std::os::unix::fs::PermissionsExt;
     use std::process::Command;
 
     fn cargo_bin() -> Command {
@@ -255,5 +256,111 @@ mod tests {
         let stdout = String::from_utf8(listed.stdout).unwrap();
         assert!(stdout.contains("work"));
         assert!(!stdout.contains('*'), "{stdout}");
+    }
+
+    #[test]
+    fn cli_restore_dry_run_prints_plan_without_connecting() {
+        let dir = tempfile::tempdir().unwrap();
+        let session_dir = dir.path().join("sessions");
+        std::fs::create_dir_all(&session_dir).unwrap();
+        let session_file = session_dir.join("work.toml");
+        std::fs::write(
+            &session_file,
+            "[session]\nname = \"work\"\ntimestamp = 1700000000\n\n[[window]]\napp_id = \"foot\"\nlaunch_cmd = \"foot\"\nworkspace = \"1\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&session_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(&session_file, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        let config_path = dir.path().join("test.toml");
+        std::fs::write(
+            &config_path,
+            format!(
+                "[general]\nsession_dir = \"{}\"\nnotify = false\n",
+                dir.path().to_string_lossy()
+            ),
+        )
+        .unwrap();
+
+        let output = cargo_bin()
+            .args([
+                "--config",
+                config_path.to_str().unwrap(),
+                "restore",
+                "--dry-run",
+                "work",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        assert!(
+            stdout.contains("exec [workspace 1 silent] foot"),
+            "{stdout}"
+        );
+        assert_eq!(
+            std::fs::metadata(&session_dir)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o755
+        );
+        assert_eq!(
+            std::fs::metadata(&session_file)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o644
+        );
+    }
+
+    #[test]
+    fn cli_status_json_parses_when_hyprland_is_down() {
+        let dir = tempfile::tempdir().unwrap();
+        let session_dir = dir.path().join("sessions");
+        std::fs::create_dir_all(&session_dir).unwrap();
+        std::fs::write(
+            session_dir.join("work.toml"),
+            "[session]\nname = \"work\"\ntimestamp = 1700000000\n\n[[window]]\napp_id = \"foot\"\nlaunch_cmd = \"foot\"\nworkspace = \"1\"\n",
+        )
+        .unwrap();
+
+        let config_path = dir.path().join("test.toml");
+        std::fs::write(
+            &config_path,
+            format!(
+                "[general]\nsession_dir = \"{}\"\nnotify = false\n",
+                dir.path().to_string_lossy()
+            ),
+        )
+        .unwrap();
+
+        let output = cargo_bin()
+            .args([
+                "--config",
+                config_path.to_str().unwrap(),
+                "status",
+                "--json",
+            ])
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(value["schemaVersion"], 1);
+        assert_eq!(value["hyprlandRunning"], false);
+        assert_eq!(value["windows"], 0);
+        assert_eq!(value["latest"]["name"], "work");
+        assert_eq!(value["latest"]["savedAt"], 1_700_000_000);
+        assert_eq!(value["latest"]["windows"], 1);
+        assert!(value["pin"].is_null());
+        assert!(value["disabled"].is_boolean());
+        assert_eq!(value["restoreOnStart"], true);
+        assert!(value["sessionDir"].as_str().unwrap().ends_with("sessions"));
     }
 }

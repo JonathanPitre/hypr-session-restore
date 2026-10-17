@@ -195,12 +195,23 @@ async fn maybe_auto_restore(
         config.general.restore_geometry,
         config.general.restore_layout,
     );
-    let (report, _watcher) = engine.restore(&plan.session, ctl, live_windows).await?;
+    let (report, _watcher) = match engine.restore(&plan.session, ctl, live_windows).await {
+        Ok(result) => result,
+        Err(err) => {
+            crate::core::notify::notify_outcome(config.general.notify, false, &err.to_string());
+            return Err(err);
+        }
+    };
     if report.failed > 0 {
         for (app, err) in &report.errors {
             tracing::warn!("restore failed for {app}: {err}");
         }
     }
+    crate::core::notify::notify_outcome(
+        config.general.notify,
+        report.failed == 0,
+        &format!("session '{}'", plan.name),
+    );
     Ok(())
 }
 

@@ -94,8 +94,13 @@ fn window_to_entry(w: &TrackedWindow, cwd: Option<String>) -> WindowEntry {
 
 impl SnapshotEngine {
     pub fn new(config: &Config) -> Result<Self> {
+        Self::open(config, false)
+    }
+
+    /// `readonly` skips directory creation and mode repair.
+    pub fn open(config: &Config, readonly: bool) -> Result<Self> {
         let session_dir = config.session_dir();
-        let dir = PrivateDir::open(&session_dir, false)?;
+        let dir = PrivateDir::open(&session_dir, readonly)?;
 
         Ok(Self {
             dir,

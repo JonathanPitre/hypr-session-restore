@@ -1880,6 +1880,26 @@ pub fn validate_session(session: &SessionFile) -> Result<()> {
     Ok(())
 }
 
+/// Launch and monitor-bind lines for a session, using the same constructors as restore.
+pub fn plan_restore(session: &SessionFile) -> Result<Vec<String>> {
+    validate_session(session)?;
+    let mut lines = Vec::new();
+    let mut bound = HashSet::new();
+    for window in &session.windows {
+        if let Some(monitor) = window.monitor.as_deref().filter(|name| !name.is_empty()) {
+            let key = (window.workspace.clone(), monitor.to_string());
+            if bound.insert(key) {
+                lines.push(move_workspace_to_monitor(&window.workspace, monitor)?);
+            }
+        }
+    }
+    for window in &session.windows {
+        let launch = build_launch_cmd(window);
+        lines.push(exec_on_workspace(&window.workspace, &launch)?);
+    }
+    Ok(lines)
+}
+
 /// Build the exec command, injecting browser profile flags and/or saved CWD.
 ///
 /// Profile flags (e.g. `-P work`, `--profile-directory=Profile 1`) are

@@ -5,11 +5,27 @@
 # Seconds between automatic session snapshots
 save_interval = 120
 
-# Where session files are stored
+# Where session files are stored. The directory is kept at mode 0700 and
+# session files at 0600. Symlinks are refused. Writes are atomic.
 session_dir = "~/.local/share/hypr-persist"
 
-# Automatically restore the "last" session on daemon start
+# Restore the pinned session on daemon start, or the newest session when
+# nothing is pinned. A regular file named "disabled" in this directory
+# (a symlink in that place counts too, and is not followed) turns that off.
+# A stamp under $XDG_RUNTIME_DIR/hypr-persist stops a second automatic
+# restore in the same Hyprland instance.
 restore_on_start = true
+
+# Wait this many extra seconds before saving when the only change is windows
+# closing. Opening or moving a window saves on that wake instead.
+settle_delay = 10
+
+# Skip restore-on-start when more than this many windows already exist,
+# counted before include/exclude rules.
+max_preexisting_windows = 3
+
+# Call notify-send after a manual or automatic restore. Dry-run does not.
+notify = true
 
 # Launch one command per window (true) or one per unique app (false)
 per_window_launch = false
