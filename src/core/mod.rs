@@ -1,7 +1,7 @@
 pub mod daemon;
 pub mod layout;
 pub mod notify;
-mod quote;
+pub mod quote;
 pub mod restore;
 mod scheduler;
 pub mod snapshot;

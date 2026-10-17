@@ -1878,6 +1878,7 @@ fn validate_window(window: &WindowEntry) -> Result<()> {
     }
     if let Some(profile) = window.profile.as_deref() {
         crate::core::quote::reject_control_bytes(profile)?;
+        shell_words(profile)?;
     }
     shell_words(&window.launch_cmd)?;
     WorkspaceName::parse(&window.workspace)?;
@@ -1912,8 +1913,8 @@ pub fn plan_restore(session: &SessionFile) -> Result<Vec<String>> {
 
 /// Build the exec command from saved argv.
 ///
-/// `launch_cmd` is split with POSIX quoting. `profile` is one argv element
-/// and is not split on spaces. Each element is quoted once.
+/// `launch_cmd` and `profile` are split with POSIX quoting. `profile` may be
+/// several argv elements. Each element is quoted once.
 ///
 /// For known terminals with a saved cwd: strips single-instance flags and
 /// appends `--working-directory=<path>`. For other apps with a cwd: one
@@ -1932,7 +1933,7 @@ fn build_bsp_launch_cmd(window: &WindowEntry) -> Result<String> {
 fn join_launch(window: &WindowEntry, strip_single_instance: bool) -> Result<String> {
     let mut argv = shell_words(&window.launch_cmd)?;
     if let Some(profile) = window.profile.as_deref() {
-        argv.push(profile.to_string());
+        argv.extend(shell_words(profile)?);
     }
     let terminal = argv.first().and_then(|bin| terminal_flag(bin));
     if strip_single_instance || (terminal.is_some() && window.cwd.is_some()) {
@@ -2223,16 +2224,16 @@ mod tests {
     fn build_cmd_with_profile() {
         let entry = make_entry("firefox", "firefox", Some("-P work"), None);
         let cmd = build_launch_cmd(&entry).unwrap();
-        assert_eq!(cmd, "firefox '-P work'");
-        assert_eq!(shell_argv(&cmd), ["firefox", "-P work"]);
+        assert_eq!(cmd, "firefox -P work");
+        assert_eq!(shell_argv(&cmd), ["firefox", "-P", "work"]);
     }
 
     #[test]
     fn build_cmd_with_no_remote_profile() {
         let entry = make_entry("firefox", "firefox", Some("-no-remote -P dev"), None);
         let cmd = build_launch_cmd(&entry).unwrap();
-        assert_eq!(cmd, "firefox '-no-remote -P dev'");
-        assert_eq!(shell_argv(&cmd), ["firefox", "-no-remote -P dev"]);
+        assert_eq!(cmd, "firefox -no-remote -P dev");
+        assert_eq!(shell_argv(&cmd), ["firefox", "-no-remote", "-P", "dev"]);
     }
 
     #[test]
@@ -2240,7 +2241,7 @@ mod tests {
         let entry = make_entry(
             "chromium",
             "chromium",
-            Some("--profile-directory=Profile 1"),
+            Some("'--profile-directory=Profile 1'"),
             None,
         );
         let cmd = build_launch_cmd(&entry).unwrap();
@@ -2260,10 +2261,10 @@ mod tests {
             None,
         );
         let cmd = build_launch_cmd(&entry).unwrap();
-        assert_eq!(cmd, "flatpak run org.mozilla.firefox '-P work'");
+        assert_eq!(cmd, "flatpak run org.mozilla.firefox -P work");
         assert_eq!(
             shell_argv(&cmd),
-            ["flatpak", "run", "org.mozilla.firefox", "-P work"]
+            ["flatpak", "run", "org.mozilla.firefox", "-P", "work"]
         );
     }
 
@@ -2328,6 +2329,13 @@ mod tests {
 
         let ok = make_entry("foot", "foot", Some("-P work"), None);
         assert!(validate_session(&session_of(ok)).is_ok());
+    }
+
+    #[test]
+    fn validate_window_rejects_unclosed_quote_in_profile() {
+        let window = make_entry("firefox", "firefox", Some("'-P"), None);
+        let err = validate_window(&window).unwrap_err();
+        assert!(err.to_string().contains("unclosed quote"), "{err}");
     }
 
     #[test]

@@ -1,5 +1,7 @@
 use std::path::Path;
 
+use crate::core::quote::shell_quote;
+
 const FIREFOX_BROWSERS: &[&str] = &[
     "firefox",
     "firefox-esr",
@@ -30,7 +32,9 @@ enum BrowserFamily {
 /// Detect browser profile arguments from `/proc/<pid>/cmdline`.
 ///
 /// Returns the profile flags to append to the launch command at restore time,
-/// e.g. `"-P work"` or `"--profile-directory=Profile 1"`.
+/// as shell words. Bare when every byte needs no quoting, POSIX single-quoted
+/// otherwise. Examples: `"-P work"`, `"-no-remote -P dev"`,
+/// `"'--profile-directory=Profile 1'"`.
 pub fn detect_browser_profile(pid: i64) -> Option<String> {
     if pid <= 0 {
         return None;
@@ -137,7 +141,7 @@ fn classify_flatpak_browser(args: &[String]) -> Option<(BrowserFamily, usize)> {
 /// Extract Firefox-family profile flags: `-P <name>`, `-profile <path>`,
 /// and the companion `-no-remote` flag needed for multi-profile sessions.
 fn extract_firefox_profile(args: &[String]) -> Option<String> {
-    let mut profile_flag: Option<String> = None;
+    let mut profile_args: Vec<String> = Vec::new();
     let mut no_remote = false;
     let mut i = 0;
 
@@ -145,13 +149,13 @@ fn extract_firefox_profile(args: &[String]) -> Option<String> {
         let arg = &args[i];
 
         if arg == "-P" && i + 1 < args.len() {
-            profile_flag = Some(format!("-P {}", args[i + 1]));
+            profile_args = vec!["-P".to_string(), args[i + 1].clone()];
             i += 2;
             continue;
         }
 
         if (arg == "--profile" || arg == "-profile") && i + 1 < args.len() {
-            profile_flag = Some(format!("-profile {}", args[i + 1]));
+            profile_args = vec!["-profile".to_string(), args[i + 1].clone()];
             i += 2;
             continue;
         }
@@ -160,7 +164,7 @@ fn extract_firefox_profile(args: &[String]) -> Option<String> {
         if let Some(name) = arg.strip_prefix("-P")
             && !name.is_empty()
         {
-            profile_flag = Some(format!("-P {name}"));
+            profile_args = vec!["-P".to_string(), name.to_string()];
         }
 
         if arg == "-no-remote" || arg == "--no-remote" {
@@ -170,22 +174,28 @@ fn extract_firefox_profile(args: &[String]) -> Option<String> {
         i += 1;
     }
 
-    let profile = profile_flag?;
-    if no_remote {
-        Some(format!("-no-remote {profile}"))
-    } else {
-        Some(profile)
+    if profile_args.is_empty() {
+        return None;
     }
+    if no_remote {
+        profile_args.insert(0, "-no-remote".to_string());
+    }
+    Some(join_profile_argv(&profile_args))
 }
 
 /// Extract Chromium-family profile flag: `--profile-directory=<name>`.
 fn extract_chromium_profile(args: &[String]) -> Option<String> {
-    for arg in args {
-        if arg.starts_with("--profile-directory=") {
-            return Some(arg.clone());
-        }
-    }
-    None
+    args.iter()
+        .find(|arg| arg.starts_with("--profile-directory="))
+        .map(|arg| shell_quote(arg))
+}
+
+/// Join profile argv with the crate shell-word rule.
+fn join_profile_argv(args: &[String]) -> String {
+    args.iter()
+        .map(|arg| shell_quote(arg))
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 #[cfg(test)]
@@ -312,7 +322,7 @@ mod tests {
         let args = vec![s("chromium"), s("--profile-directory=Profile 1")];
         assert_eq!(
             detect_profile_from_args(&args),
-            Some(s("--profile-directory=Profile 1"))
+            Some(s("'--profile-directory=Profile 1'"))
         );
     }
 
@@ -330,7 +340,7 @@ mod tests {
         let args = vec![s("brave-browser"), s("--profile-directory=Profile 2")];
         assert_eq!(
             detect_profile_from_args(&args),
-            Some(s("--profile-directory=Profile 2"))
+            Some(s("'--profile-directory=Profile 2'"))
         );
     }
 
@@ -454,5 +464,31 @@ mod tests {
     #[test]
     fn empty_args() {
         assert_eq!(detect_profile_from_args(&[]), None);
+    }
+
+    #[test]
+    fn detect_profile_from_args_round_trips_through_shell_words() {
+        let firefox_multi = vec![s("firefox"), s("-no-remote"), s("-P"), s("dev")];
+        let stored = detect_profile_from_args(&firefox_multi).unwrap();
+        assert_eq!(
+            crate::core::quote::shell_words(&stored).unwrap(),
+            [s("-no-remote"), s("-P"), s("dev")]
+        );
+
+        let chromium = vec![s("chromium"), s("--profile-directory=Profile 1")];
+        let stored = detect_profile_from_args(&chromium).unwrap();
+        assert_eq!(
+            crate::core::quote::shell_words(&stored).unwrap(),
+            [s("--profile-directory=Profile 1")]
+        );
+
+        // Bare `-P work` stays one stored string; shell words are the two argv elements.
+        let firefox_simple = vec![s("firefox"), s("-P"), s("work")];
+        let stored = detect_profile_from_args(&firefox_simple).unwrap();
+        assert_eq!(stored, "-P work");
+        assert_eq!(
+            crate::core::quote::shell_words(&stored).unwrap(),
+            [s("-P"), s("work")]
+        );
     }
 }
