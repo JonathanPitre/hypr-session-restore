@@ -1880,13 +1880,16 @@ fn validate_window(window: &WindowEntry) -> Result<()> {
         crate::core::quote::reject_control_bytes(profile)?;
         shell_words(profile)?;
     }
-    shell_words(&window.launch_cmd)?;
+    let launch_argv = shell_words(&window.launch_cmd)?;
+    if window.launch_cmd.is_empty() {
+        bail!("empty launch command for '{}'", window.app_id);
+    }
+    if launch_argv.first().is_some_and(String::is_empty) {
+        bail!("empty program in launch command for '{}'", window.app_id);
+    }
     WorkspaceName::parse(&window.workspace)?;
     if let Some(monitor) = window.monitor.as_deref().filter(|name| !name.is_empty()) {
         crate::core::quote::MonitorName::parse(monitor)?;
-    }
-    if window.launch_cmd.is_empty() {
-        bail!("empty launch command for '{}'", window.app_id);
     }
     Ok(())
 }
@@ -2336,6 +2339,54 @@ mod tests {
         let window = make_entry("firefox", "firefox", Some("'-P"), None);
         let err = validate_window(&window).unwrap_err();
         assert!(err.to_string().contains("unclosed quote"), "{err}");
+    }
+
+    #[test]
+    fn empty_middle_argument_survives_round_trip() {
+        let entry = make_entry("app", "app --title '' --flag", None, None);
+        validate_window(&entry).unwrap();
+        let cmd = build_launch_cmd(&entry).unwrap();
+        assert_eq!(shell_argv(&cmd), ["app", "--title", "", "--flag"]);
+        assert_eq!(shell_words(&cmd).unwrap(), ["app", "--title", "", "--flag"]);
+    }
+
+    #[test]
+    fn empty_argument_survives_cwd_and_terminal_flag() {
+        let terminal = make_entry("ghostty", "ghostty --title ''", None, Some("/tmp/work"));
+        let cmd = build_launch_cmd(&terminal).unwrap();
+        assert_eq!(
+            shell_argv(&cmd),
+            ["ghostty", "--title", "", "--working-directory=/tmp/work"]
+        );
+
+        let wrapped = make_entry("app", "app --title '' --flag", None, Some("/tmp/work"));
+        let cmd = build_launch_cmd(&wrapped).unwrap();
+        let args = shell_argv(&cmd);
+        assert_eq!(args[0], "sh");
+        assert_eq!(args[1], "-c");
+        let exec_tail = args[2].split_once(" && exec ").unwrap().1;
+        assert_eq!(shell_argv(exec_tail), ["app", "--title", "", "--flag"]);
+    }
+
+    #[test]
+    fn validate_window_rejects_empty_program() {
+        let window = make_entry("app", "'' --flag", None, None);
+        let err = validate_window(&window).unwrap_err();
+        assert!(err.to_string().contains("empty program"), "{err}");
+    }
+
+    #[test]
+    fn proc_apostrophe_and_backslash_paths_round_trip() {
+        let cases = ["/opt/O'Brien/bin/app", r"/opt/foo\bar\app"];
+        for program in cases {
+            let argv = vec![program.to_string()];
+            let launch = crate::resolver::proc::resolve_from_args(&argv, &|_| false).unwrap();
+            let entry = make_entry("app", &launch, None, None);
+            validate_window(&entry).unwrap();
+            let cmd = build_launch_cmd(&entry).unwrap();
+            assert_eq!(shell_argv(&cmd), argv.as_slice());
+            assert_eq!(shell_words(&cmd).unwrap(), argv);
+        }
     }
 
     #[test]

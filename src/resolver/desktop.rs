@@ -1,3 +1,4 @@
+use crate::core::quote::{shell_quote, shell_words};
 use crate::models::DesktopEntry;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -155,12 +156,25 @@ pub fn parse_desktop_content(content: &str, path: &Path) -> Option<DesktopEntry>
     } else {
         exec
     };
+    let exec = quote_stored_exec(&exec);
 
     Some(DesktopEntry {
         exec,
         startup_wm_class,
         desktop_id,
     })
+}
+
+/// Re-quote a cleaned Exec line so `shell_words` returns the same elements.
+fn quote_stored_exec(exec: &str) -> String {
+    let Ok(words) = shell_words(exec) else {
+        return exec.to_string();
+    };
+    words
+        .iter()
+        .map(|word| shell_quote(word))
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// Strip field codes (%f, %F, %u, %U, etc.), env var prefixes,
@@ -203,15 +217,16 @@ pub fn simplify_flatpak_exec(exec: &str, desktop_id: &str) -> Option<String> {
 
 /// Extract the basename of the executable from an Exec line.
 pub fn exec_basename_of(exec: &str) -> Option<String> {
-    let first_token = exec.split_whitespace().next()?;
+    let words = shell_words(exec).ok()?;
+    let first_token = words.first()?;
 
     // Handle "flatpak run org.foo.Bar"
     if first_token.contains("flatpak")
-        && let Some(app_id) = exec.split_whitespace().last()
+        && let Some(app_id) = words.last()
         && app_id.contains('.')
         && !app_id.starts_with('-')
     {
-        return Some(app_id.to_string());
+        return Some(app_id.clone());
     }
 
     let basename = Path::new(first_token)
@@ -422,6 +437,25 @@ mod tests {
         .unwrap();
 
         assert_eq!(entry.exec, "myapp");
+    }
+
+    #[test]
+    fn double_quoted_exec_value_round_trips() {
+        let entry = make_desktop(
+            "[Desktop Entry]\n\
+             Name=My App\n\
+             Exec=myapp --title \"Hello World\" %u\n",
+        )
+        .unwrap();
+
+        assert_eq!(entry.exec, "myapp --title 'Hello World'");
+        assert_eq!(
+            crate::core::quote::shell_words(&entry.exec).unwrap(),
+            ["myapp", "--title", "Hello World"]
+                .into_iter()
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        );
     }
 
     #[test]

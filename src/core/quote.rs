@@ -58,10 +58,11 @@ impl WindowAddress {
     }
 }
 
-/// Leave `s` unquoted when every byte is in `A-Za-z0-9_./@=:+-`.
-/// Otherwise wrap it in POSIX single quotes.
+/// Leave `text` unquoted when it is non-empty and every byte is in
+/// `A-Za-z0-9_./@=:+-`. The empty word is `''`, so a quoted empty argument
+/// survives a round-trip. Every other word is wrapped in POSIX single quotes.
 pub fn shell_quote(text: &str) -> String {
-    if text.bytes().all(is_bare_byte) {
+    if !text.is_empty() && text.bytes().all(is_bare_byte) {
         text.to_string()
     } else {
         posix_single_quote(text)
@@ -357,6 +358,8 @@ mod tests {
         assert_eq!(shell_quote("$(id)"), "'$(id)'");
         assert_eq!(shell_quote("`id`"), "'`id`'");
         assert_eq!(shell_quote("foot"), "foot");
+        assert_eq!(shell_quote(""), "''");
+        assert_eq!(shell_words(&shell_quote("")).unwrap(), vec![String::new()]);
     }
 
     #[test]

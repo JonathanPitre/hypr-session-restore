@@ -1,5 +1,7 @@
 use std::path::Path;
 
+use crate::core::quote::shell_quote;
+
 const INTERPRETER_PREFIXES: &[&str] = &[
     "python3", "python", "node", "electron", "ruby", "perl", "java", "sh", "bash", "zsh", "fish",
     "env",
@@ -59,16 +61,16 @@ pub fn resolve_from_args(args: &[String], which_fn: &dyn Fn(&str) -> bool) -> Op
 
     if program.starts_with('/') {
         if which_fn(&basename) {
-            return Some(basename);
+            return Some(shell_quote(&basename));
         }
-        return Some(program.clone());
+        return Some(shell_quote(program));
     }
 
     if which_fn(&basename) {
-        return Some(basename);
+        return Some(shell_quote(&basename));
     }
 
-    Some(program.clone())
+    Some(shell_quote(program))
 }
 
 fn which_exists(name: &str) -> bool {
