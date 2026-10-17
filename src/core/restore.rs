@@ -10,7 +10,7 @@ use crate::core::layout::master::{self, MasterPlan};
 use crate::core::quote::posix_single_quote;
 use crate::core::quote::{
     WorkspaceName, exec_here, exec_on_workspace, focus_window, move_to_workspace_silent,
-    move_workspace_to_monitor, normalize_windowrule_name, shell_join, shell_quote,
+    move_workspace_to_monitor, normalize_windowrule_name, shell_quote, shell_words,
     workspace_switch,
 };
 use crate::core::state::normalize_address;
@@ -915,7 +915,7 @@ impl RestoreEngine {
             workspace.as_str()
         ))
         .await?;
-        let launch_cmd = build_bsp_launch_cmd(window);
+        let launch_cmd = build_bsp_launch_cmd(window)?;
         ctl.dispatch(&exec_here(&launch_cmd))
             .await
             .with_context(|| format!("launching {}", window.launch_cmd))?;
@@ -1500,7 +1500,7 @@ impl RestoreEngine {
         ))
         .await?;
 
-        let launch_cmd = build_launch_cmd(window);
+        let launch_cmd = build_launch_cmd(window)?;
         ctl.dispatch(&exec_on_workspace(&window.workspace, &launch_cmd)?)
             .await
             .with_context(|| format!("launching {}", window.launch_cmd))?;
@@ -1867,15 +1867,25 @@ async fn apply_late_window(
 }
 
 pub fn validate_session(session: &SessionFile) -> Result<()> {
-    for window in &session.windows {
-        crate::core::quote::reject_control_bytes(&window.app_id)?;
-        WorkspaceName::parse(&window.workspace)?;
-        if let Some(monitor) = window.monitor.as_deref().filter(|name| !name.is_empty()) {
-            crate::core::quote::MonitorName::parse(monitor)?;
-        }
-        if window.launch_cmd.is_empty() {
-            bail!("empty launch command for '{}'", window.app_id);
-        }
+    session.windows.iter().try_for_each(validate_window)
+}
+
+fn validate_window(window: &WindowEntry) -> Result<()> {
+    crate::core::quote::reject_control_bytes(&window.app_id)?;
+    crate::core::quote::reject_control_bytes(&window.launch_cmd)?;
+    if let Some(cwd) = window.cwd.as_deref() {
+        crate::core::quote::reject_control_bytes(cwd)?;
+    }
+    if let Some(profile) = window.profile.as_deref() {
+        crate::core::quote::reject_control_bytes(profile)?;
+    }
+    shell_words(&window.launch_cmd)?;
+    WorkspaceName::parse(&window.workspace)?;
+    if let Some(monitor) = window.monitor.as_deref().filter(|name| !name.is_empty()) {
+        crate::core::quote::MonitorName::parse(monitor)?;
+    }
+    if window.launch_cmd.is_empty() {
+        bail!("empty launch command for '{}'", window.app_id);
     }
     Ok(())
 }
@@ -1894,64 +1904,60 @@ pub fn plan_restore(session: &SessionFile) -> Result<Vec<String>> {
         }
     }
     for window in &session.windows {
-        let launch = build_launch_cmd(window);
+        let launch = build_launch_cmd(window)?;
         lines.push(exec_on_workspace(&window.workspace, &launch)?);
     }
     Ok(lines)
 }
 
-/// Build the exec command, injecting browser profile flags and/or saved CWD.
+/// Build the exec command from saved argv.
 ///
-/// Profile flags (e.g. `-P work`, `--profile-directory=Profile 1`) are
-/// appended to the base launch command before CWD handling, since browsers
-/// and terminals are mutually exclusive in practice.
+/// `launch_cmd` is split with POSIX quoting. `profile` is one argv element
+/// and is not split on spaces. Each element is quoted once.
 ///
-/// For known terminals: strips single-instance flags (so each launch is
-/// its own process) and appends `--working-directory=<path>`.
-/// For other apps with CWD: wraps with `cd <path> && exec <cmd>`.
-fn build_launch_cmd(window: &WindowEntry) -> String {
-    let raw = window.profile.as_ref().map_or_else(
-        || window.launch_cmd.clone(),
-        |profile| format!("{} {profile}", window.launch_cmd),
-    );
-    let cmd = shell_join(&raw);
-
-    let Some(cwd) = window.cwd.as_deref() else {
-        return cmd;
-    };
-
-    terminal_cwd_flag(&raw).map_or_else(
-        || {
-            let escaped = posix_single_quote(cwd);
-            format!("sh -c 'cd {escaped} && exec {cmd}'")
-        },
-        |flag| {
-            let clean = strip_single_instance_flags(&cmd);
-            format!("{clean} {flag}{}", shell_quote(cwd))
-        },
-    )
+/// For known terminals with a saved cwd: strips single-instance flags and
+/// appends `--working-directory=<path>`. For other apps with a cwd: one
+/// `sh -c` argument whose script is `cd <path> && exec <argv>`.
+fn build_launch_cmd(window: &WindowEntry) -> Result<String> {
+    join_launch(window, false)
 }
 
-fn strip_single_instance_flags(cmd: &str) -> String {
-    cmd.split_whitespace()
-        .filter(|arg| !SINGLE_INSTANCE_FLAGS.contains(arg))
+/// BSP restore always strips single-instance flags so each launch is its own
+/// process. A single-instance app would open on the existing process's
+/// workspace and skip the preselect on the target workspace.
+fn build_bsp_launch_cmd(window: &WindowEntry) -> Result<String> {
+    join_launch(window, true)
+}
+
+fn join_launch(window: &WindowEntry, strip_single_instance: bool) -> Result<String> {
+    let mut argv = shell_words(&window.launch_cmd)?;
+    if let Some(profile) = window.profile.as_deref() {
+        argv.push(profile.to_string());
+    }
+    let terminal = argv.first().and_then(|bin| terminal_flag(bin));
+    if strip_single_instance || (terminal.is_some() && window.cwd.is_some()) {
+        argv.retain(|arg| !SINGLE_INSTANCE_FLAGS.contains(&arg.as_str()));
+    }
+    let cmd = quote_join(&argv);
+    let Some(cwd) = window.cwd.as_deref() else {
+        return Ok(cmd);
+    };
+    if let Some(flag) = terminal {
+        return Ok(format!("{cmd} {flag}{}", shell_quote(cwd)));
+    }
+    let script = format!("cd {} && exec {cmd}", shell_quote(cwd));
+    Ok(format!("sh -c {}", posix_single_quote(&script)))
+}
+
+fn quote_join(argv: &[String]) -> String {
+    argv.iter()
+        .map(|arg| shell_quote(arg))
         .collect::<Vec<_>>()
         .join(" ")
 }
 
-/// Build launch command for BSP restore: always strips single-instance flags
-/// so each launch creates an independent process (critical for preselect to
-/// work, since single-instance apps create windows in the existing process's
-/// workspace, bypassing the preselection on the target workspace).
-fn build_bsp_launch_cmd(window: &WindowEntry) -> String {
-    let base = build_launch_cmd(window);
-    strip_single_instance_flags(&base)
-}
-
-/// Match the binary name in a launch command against known terminals
-/// and return the appropriate `--working-directory=` style flag.
-fn terminal_cwd_flag(launch_cmd: &str) -> Option<&'static str> {
-    let bin = launch_cmd.split_whitespace().next()?.rsplit('/').next()?;
+fn terminal_flag(argv0: &str) -> Option<&'static str> {
+    let bin = argv0.rsplit_once('/').map_or(argv0, |(_, base)| base);
     TERMINAL_CWD_FLAGS
         .iter()
         .find(|(name, _)| *name == bin)
@@ -2032,6 +2038,8 @@ pub struct RestoreReport {
 mod tests {
     use super::*;
     use crate::ipc::client::HyprSocketPaths;
+    use crate::models::SessionMeta;
+    use std::process::Command;
     use std::sync::Arc;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::UnixListener;
@@ -2183,19 +2191,48 @@ mod tests {
     #[test]
     fn build_cmd_no_profile_no_cwd() {
         let entry = make_entry("firefox", "firefox", None, None);
-        assert_eq!(build_launch_cmd(&entry), "firefox");
+        assert_eq!(build_launch_cmd(&entry).unwrap(), "firefox");
+    }
+
+    fn shell_argv(cmd: &str) -> Vec<String> {
+        let script = format!("set -- {cmd}\nfor arg in \"$@\"; do printf '%s\\n' \"$arg\"; done");
+        let output = Command::new("sh").arg("-c").arg(&script).output().unwrap();
+        assert!(
+            output.status.success(),
+            "{cmd}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout)
+            .unwrap()
+            .lines()
+            .map(str::to_string)
+            .collect()
+    }
+
+    fn session_of(window: WindowEntry) -> SessionFile {
+        SessionFile {
+            session: SessionMeta {
+                name: "t".to_string(),
+                timestamp: 0,
+            },
+            windows: vec![window],
+        }
     }
 
     #[test]
     fn build_cmd_with_profile() {
         let entry = make_entry("firefox", "firefox", Some("-P work"), None);
-        assert_eq!(build_launch_cmd(&entry), "firefox -P work");
+        let cmd = build_launch_cmd(&entry).unwrap();
+        assert_eq!(cmd, "firefox '-P work'");
+        assert_eq!(shell_argv(&cmd), ["firefox", "-P work"]);
     }
 
     #[test]
     fn build_cmd_with_no_remote_profile() {
         let entry = make_entry("firefox", "firefox", Some("-no-remote -P dev"), None);
-        assert_eq!(build_launch_cmd(&entry), "firefox -no-remote -P dev");
+        let cmd = build_launch_cmd(&entry).unwrap();
+        assert_eq!(cmd, "firefox '-no-remote -P dev'");
+        assert_eq!(shell_argv(&cmd), ["firefox", "-no-remote -P dev"]);
     }
 
     #[test]
@@ -2206,9 +2243,11 @@ mod tests {
             Some("--profile-directory=Profile 1"),
             None,
         );
+        let cmd = build_launch_cmd(&entry).unwrap();
+        assert_eq!(cmd, "chromium '--profile-directory=Profile 1'");
         assert_eq!(
-            build_launch_cmd(&entry),
-            "chromium --profile-directory=Profile 1"
+            shell_argv(&cmd),
+            ["chromium", "--profile-directory=Profile 1"]
         );
     }
 
@@ -2220,17 +2259,82 @@ mod tests {
             Some("-P work"),
             None,
         );
+        let cmd = build_launch_cmd(&entry).unwrap();
+        assert_eq!(cmd, "flatpak run org.mozilla.firefox '-P work'");
         assert_eq!(
-            build_launch_cmd(&entry),
-            "flatpak run org.mozilla.firefox -P work"
+            shell_argv(&cmd),
+            ["flatpak", "run", "org.mozilla.firefox", "-P work"]
         );
+    }
+
+    #[test]
+    fn build_cmd_quoted_executable_stays_one_argument() {
+        let entry = make_entry("app", r#""/opt/My App/bin/app" --flag"#, None, None);
+        let cmd = build_launch_cmd(&entry).unwrap();
+        assert_eq!(cmd, "'/opt/My App/bin/app' --flag");
+        assert_eq!(shell_argv(&cmd), ["/opt/My App/bin/app", "--flag"]);
+        assert_eq!(
+            exec_on_workspace("1", &cmd).unwrap(),
+            "exec [workspace 1 silent] '/opt/My App/bin/app' --flag"
+        );
+    }
+
+    #[test]
+    fn cwd_wrapper_is_one_sh_argument_and_changes_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("My Project's");
+        std::fs::create_dir(&project).unwrap();
+        let entry = make_entry("pwd", "pwd", None, Some(project.to_str().unwrap()));
+        let cmd = build_launch_cmd(&entry).unwrap();
+        let args = shell_argv(&cmd);
+        assert_eq!(args.len(), 3, "{cmd} -> {args:?}");
+        assert_eq!(args[0], "sh");
+        assert_eq!(args[1], "-c");
+        let output = Command::new("sh").arg("-c").arg(&args[2]).output().unwrap();
+        assert!(
+            output.status.success(),
+            "{cmd}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            String::from_utf8(output.stdout).unwrap().trim(),
+            project.to_str().unwrap()
+        );
+    }
+
+    #[test]
+    fn cwd_wrapper_does_not_run_command_substitution() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("pwned");
+        let cwd = format!("$(touch {})", marker.display());
+        let entry = make_entry("true", "true", None, Some(&cwd));
+        let cmd = build_launch_cmd(&entry).unwrap();
+        let args = shell_argv(&cmd);
+        assert_eq!(args.len(), 3, "{cmd} -> {args:?}");
+        drop(Command::new("sh").arg("-c").arg(&args[2]).status());
+        assert!(!marker.exists(), "command substitution ran: {cmd}");
+    }
+
+    #[test]
+    fn validate_session_rejects_control_bytes_in_launch_cwd_and_profile() {
+        let launch = make_entry("foot", "foot\n", None, None);
+        assert!(validate_session(&session_of(launch)).is_err());
+
+        let cwd = make_entry("foot", "foot", None, Some("/tmp/\u{1}"));
+        assert!(validate_session(&session_of(cwd)).is_err());
+
+        let profile = make_entry("foot", "foot", Some("ok\t"), None);
+        assert!(validate_session(&session_of(profile)).is_err());
+
+        let ok = make_entry("foot", "foot", Some("-P work"), None);
+        assert!(validate_session(&session_of(ok)).is_ok());
     }
 
     #[test]
     fn build_cmd_with_cwd_no_profile() {
         let entry = make_entry("ghostty", "ghostty", None, Some("/home/user/project"));
         assert_eq!(
-            build_launch_cmd(&entry),
+            build_launch_cmd(&entry).unwrap(),
             "ghostty --working-directory=/home/user/project"
         );
     }
@@ -2238,7 +2342,7 @@ mod tests {
     #[test]
     fn build_cmd_profile_does_not_affect_cwd() {
         let entry = make_entry("ghostty", "ghostty", None, Some("/tmp"));
-        let cmd = build_launch_cmd(&entry);
+        let cmd = build_launch_cmd(&entry).unwrap();
         assert!(cmd.contains("--working-directory=/tmp"));
     }
 
