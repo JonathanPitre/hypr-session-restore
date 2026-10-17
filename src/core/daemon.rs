@@ -427,13 +427,11 @@ async fn handle_event(
         }
         HyprEvent::MoveWindow { address, workspace } => {
             let mut state = state.lock().await;
-            state.update_workspace(&address, &workspace);
-            true
+            state.update_workspace(&address, &workspace)
         }
         HyprEvent::ChangeFloatingMode { address, floating } => {
             let mut state = state.lock().await;
-            state.update_floating(&address, floating);
-            true
+            state.update_floating(&address, floating)
         }
         HyprEvent::Fullscreen { state } => {
             tracing::debug!("fullscreen toggled: {state}");
@@ -443,5 +441,133 @@ async fn handle_event(
             tracing::trace!("unhandled event: {raw}");
             false
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::handle_event;
+    use crate::config::Config;
+    use crate::core::state::StateManager;
+    use crate::ipc::client::{HyprCtl, HyprSocketPaths};
+    use crate::models::{HyprEvent, TrackedWindow};
+    use crate::resolver::AppResolver;
+    use std::path::PathBuf;
+    use std::sync::Arc;
+    use tokio::sync::Mutex;
+
+    fn harness() -> (Arc<Mutex<StateManager>>, Arc<AppResolver>, HyprCtl) {
+        let config = Config::default();
+        (
+            Arc::new(Mutex::new(StateManager::new(&config))),
+            Arc::new(AppResolver::new(&config)),
+            HyprCtl::new(HyprSocketPaths::new(
+                PathBuf::from("/tmp/hypr-persist-unused.sock"),
+                PathBuf::from("/tmp/hypr-persist-unused.sock2"),
+            )),
+        )
+    }
+
+    fn tracked(address: &str, workspace: &str, floating: bool) -> TrackedWindow {
+        TrackedWindow {
+            address: address.to_string(),
+            app_id: "firefox".to_string(),
+            launch_cmd: "firefox".to_string(),
+            workspace: workspace.to_string(),
+            monitor: String::new(),
+            position: (0, 0),
+            size: (800, 600),
+            floating,
+            fullscreen: false,
+            pid: 0,
+            profile: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn untracked_move_and_float_are_not_material() {
+        let (state, resolver, ctl) = harness();
+        assert!(
+            !handle_event(
+                HyprEvent::MoveWindow {
+                    address: "0xabc".to_string(),
+                    workspace: "2".to_string(),
+                },
+                &state,
+                &resolver,
+                &ctl,
+            )
+            .await
+        );
+        assert!(
+            !handle_event(
+                HyprEvent::ChangeFloatingMode {
+                    address: "0xabc".to_string(),
+                    floating: true,
+                },
+                &state,
+                &resolver,
+                &ctl,
+            )
+            .await
+        );
+    }
+
+    #[tokio::test]
+    async fn unchanged_tracked_move_and_float_are_not_material() {
+        let (state, resolver, ctl) = harness();
+        state.lock().await.add(tracked("0xabc", "1", false));
+
+        assert!(
+            !handle_event(
+                HyprEvent::MoveWindow {
+                    address: "abc".to_string(),
+                    workspace: "1".to_string(),
+                },
+                &state,
+                &resolver,
+                &ctl,
+            )
+            .await
+        );
+        assert!(
+            !handle_event(
+                HyprEvent::ChangeFloatingMode {
+                    address: "0xabc".to_string(),
+                    floating: false,
+                },
+                &state,
+                &resolver,
+                &ctl,
+            )
+            .await
+        );
+
+        assert!(
+            handle_event(
+                HyprEvent::MoveWindow {
+                    address: "0xabc".to_string(),
+                    workspace: "2".to_string(),
+                },
+                &state,
+                &resolver,
+                &ctl,
+            )
+            .await
+        );
+        assert!(
+            handle_event(
+                HyprEvent::ChangeFloatingMode {
+                    address: "0xabc".to_string(),
+                    floating: true,
+                },
+                &state,
+                &resolver,
+                &ctl,
+            )
+            .await
+        );
+        assert_eq!(state.lock().await.windows()[0].workspace, "2");
+        assert!(state.lock().await.windows()[0].floating);
     }
 }

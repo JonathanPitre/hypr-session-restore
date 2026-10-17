@@ -96,6 +96,7 @@ fn init_logging(verbose: u8, quiet: bool) {
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(filter)),
         )
         .with_target(false)
+        .with_writer(std::io::stderr)
         .init();
 }
 

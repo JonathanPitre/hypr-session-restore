@@ -88,19 +88,33 @@ impl StateManager {
         w
     }
 
-    pub fn update_workspace(&mut self, address: &str, workspace: &str) {
+    /// Returns whether a tracked window's workspace actually changed.
+    #[must_use]
+    pub fn update_workspace(&mut self, address: &str, workspace: &str) -> bool {
         let key = normalize_address(address);
-        if let Some(w) = self.windows.get_mut(&key) {
-            w.workspace = workspace.to_string();
-            tracing::debug!("updated workspace: {} → {workspace}", w.app_id);
+        let Some(window) = self.windows.get_mut(&key) else {
+            return false;
+        };
+        if window.workspace == workspace {
+            return false;
         }
+        window.workspace = workspace.to_string();
+        tracing::debug!("updated workspace: {} → {workspace}", window.app_id);
+        true
     }
 
-    pub fn update_floating(&mut self, address: &str, floating: bool) {
+    /// Returns whether a tracked window's floating bit actually changed.
+    #[must_use]
+    pub fn update_floating(&mut self, address: &str, floating: bool) -> bool {
         let key = normalize_address(address);
-        if let Some(w) = self.windows.get_mut(&key) {
-            w.floating = floating;
+        let Some(window) = self.windows.get_mut(&key) else {
+            return false;
+        };
+        if window.floating == floating {
+            return false;
         }
+        window.floating = floating;
+        true
     }
 
     /// Update position, size, floating, fullscreen and monitor for all tracked
@@ -334,7 +348,8 @@ mod tests {
         let mut state = StateManager::new(&test_config(vec![], vec![]));
         state.add(make_window("0xabc", "firefox", "1"));
 
-        state.update_workspace("0xabc", "5");
+        assert!(state.update_workspace("0xabc", "5"));
+        assert!(!state.update_workspace("0xabc", "5"));
 
         let windows = state.windows();
         assert_eq!(windows[0].workspace, "5");
@@ -344,7 +359,7 @@ mod tests {
     fn update_workspace_nonexistent_is_noop() {
         let mut state = StateManager::new(&test_config(vec![], vec![]));
         state.add(make_window("0xabc", "firefox", "1"));
-        state.update_workspace("0xnonexistent", "5");
+        assert!(!state.update_workspace("0xnonexistent", "5"));
 
         let windows = state.windows();
         assert_eq!(windows[0].workspace, "1");
@@ -358,11 +373,13 @@ mod tests {
         state.add(make_window("0xabc", "firefox", "1"));
 
         assert!(!state.windows()[0].floating);
+        assert!(!state.update_floating("0xabc", false));
+        assert!(!state.update_floating("0xmissing", true));
 
-        state.update_floating("0xabc", true);
+        assert!(state.update_floating("0xabc", true));
         assert!(state.windows()[0].floating);
 
-        state.update_floating("0xabc", false);
+        assert!(state.update_floating("0xabc", false));
         assert!(!state.windows()[0].floating);
     }
 

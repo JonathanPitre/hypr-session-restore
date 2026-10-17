@@ -242,6 +242,9 @@ impl SnapshotEngine {
         } else {
             tracing::warn!("session '{name}' not found at {}", path.display());
         }
+        self.dir
+            .unlink(&predecessor_leaf(name))
+            .with_context(|| format!("deleting predecessor for '{name}'"))?;
         Ok(())
     }
 
@@ -642,6 +645,49 @@ mod tests {
         assert!(engine.exists("deleteme"));
         engine.delete("deleteme").unwrap();
         assert!(!engine.exists("deleteme"));
+    }
+
+    #[test]
+    fn delete_unlinks_predecessor_leaf() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = SnapshotEngine::new_with_dir(dir.path(), true).unwrap();
+        let first = make_state_with_windows(vec![("0xa", "firefox", "1", false)]);
+        engine.save(&first, "work").unwrap();
+        let second = make_state_with_windows(vec![
+            ("0xa", "firefox", "1", false),
+            ("0xb", "code", "2", false),
+        ]);
+        engine.save(&second, "work").unwrap();
+        assert!(
+            engine
+                .dir
+                .read_regular(".work.toml.prev")
+                .unwrap()
+                .is_some()
+        );
+
+        engine.delete("work").unwrap();
+        assert!(!engine.exists("work"));
+        assert!(
+            engine
+                .dir
+                .read_regular(".work.toml.prev")
+                .unwrap()
+                .is_none()
+        );
+
+        engine
+            .dir
+            .atomic_write(".orphan.toml.prev", b"stale")
+            .unwrap();
+        engine.delete("orphan").unwrap();
+        assert!(
+            engine
+                .dir
+                .read_regular(".orphan.toml.prev")
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]

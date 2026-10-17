@@ -363,4 +363,78 @@ mod tests {
         assert_eq!(value["restoreOnStart"], true);
         assert!(value["sessionDir"].as_str().unwrap().ends_with("sessions"));
     }
+
+    #[test]
+    fn cli_verbose_delete_keeps_log_off_stdout() {
+        let dir = tempfile::tempdir().unwrap();
+        let session_dir = dir.path().join("sessions");
+        std::fs::create_dir_all(&session_dir).unwrap();
+        let config_path = dir.path().join("test.toml");
+        std::fs::write(
+            &config_path,
+            format!(
+                "[general]\nsession_dir = \"{}\"\n",
+                session_dir.to_string_lossy()
+            ),
+        )
+        .unwrap();
+
+        let output = cargo_bin()
+            .env_remove("RUST_LOG")
+            .args([
+                "-v",
+                "--config",
+                config_path.to_str().unwrap(),
+                "delete",
+                "nonexistent",
+            ])
+            .output()
+            .unwrap();
+
+        assert!(output.status.success());
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert_eq!(stdout.trim(), "Deleted session 'nonexistent'.");
+        assert!(stderr.contains("not found"), "{stderr}");
+        assert!(!stdout.contains("not found"), "{stdout}");
+    }
+
+    #[test]
+    fn cli_verbose_status_json_stays_one_json_object() {
+        let dir = tempfile::tempdir().unwrap();
+        let session_dir = dir.path().join("sessions");
+        std::fs::create_dir_all(&session_dir).unwrap();
+        std::fs::write(
+            session_dir.join("work.toml"),
+            "[session]\nname = \"work\"\ntimestamp = 1700000000\n\n[[window]]\napp_id = \"foot\"\nlaunch_cmd = \"foot\"\nworkspace = \"1\"\n",
+        )
+        .unwrap();
+        let config_path = dir.path().join("test.toml");
+        std::fs::write(
+            &config_path,
+            format!(
+                "[general]\nsession_dir = \"{}\"\nnotify = false\n",
+                dir.path().to_string_lossy()
+            ),
+        )
+        .unwrap();
+
+        let output = cargo_bin()
+            .env_remove("RUST_LOG")
+            .args([
+                "-v",
+                "--config",
+                config_path.to_str().unwrap(),
+                "status",
+                "--json",
+            ])
+            .output()
+            .unwrap();
+
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        let value: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+        assert_eq!(value["schemaVersion"], 1);
+        assert!(!stdout.contains("INFO"), "{stdout}");
+        assert!(!stdout.contains("WARN"), "{stdout}");
+    }
 }

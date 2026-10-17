@@ -232,10 +232,10 @@ mod tests {
         assert_eq!(state.window_count(), 3);
 
         // Simulate: firefox moves to workspace 5
-        state.update_workspace("0xaaa", "5");
+        assert!(state.update_workspace("0xaaa", "5"));
 
         // Simulate: code becomes floating
-        state.update_floating("0xbbb", true);
+        assert!(state.update_floating("0xbbb", true));
 
         // Simulate: discord closes
         state.remove("0xccc");
