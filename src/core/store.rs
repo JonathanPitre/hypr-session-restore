@@ -226,8 +226,8 @@ impl PrivateDir {
     /// Read a regular file owned by the effective uid.
     ///
     /// Missing leaves are `Ok(None)`. Symlinks, fifos, and other non-regular
-    /// files are errors. A mode of `0644` is repaired to `0600` unless this
-    /// directory was opened read-only.
+    /// files are errors. Group or other permissions are repaired to `0600`
+    /// unless this directory was opened read-only.
     pub fn read_regular(&self, leaf: &str) -> Result<Option<Vec<u8>>> {
         validate_leaf(leaf)?;
         let leaf_c = cstring_bytes(leaf.as_bytes()).context("file name")?;
@@ -254,7 +254,7 @@ impl PrivateDir {
         if meta.uid() != euid() {
             bail!("refusing foreign-owned file {leaf}");
         }
-        if !self.readonly && (meta.mode() & 0o777) == 0o644 {
+        if !self.readonly && (meta.mode() & 0o077) != 0 {
             file.set_permissions(Permissions::from_mode(0o600))
                 .with_context(|| format!("repairing mode of {leaf}"))?;
         }
@@ -479,15 +479,16 @@ mod tests {
     }
 
     #[test]
-    fn repairs_0644_file_to_0600() {
+    fn repairs_group_or_other_permissions_to_0600() {
         let (_parent, store) = writable_dir();
         let path = store.path().join("note.toml");
         std::fs::write(&path, b"hello").unwrap();
-        std::fs::set_permissions(&path, Permissions::from_mode(0o644)).unwrap();
-
-        let data = store.read_regular("note.toml").unwrap().unwrap();
-        assert_eq!(data, b"hello");
-        assert_eq!(mode_of(&path), 0o600);
+        for mode in [0o644, 0o666, 0o640, 0o604] {
+            std::fs::set_permissions(&path, Permissions::from_mode(mode)).unwrap();
+            let data = store.read_regular("note.toml").unwrap().unwrap();
+            assert_eq!(data, b"hello");
+            assert_eq!(mode_of(&path), 0o600);
+        }
     }
 
     #[test]

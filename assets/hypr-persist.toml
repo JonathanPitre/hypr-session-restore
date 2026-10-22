@@ -21,7 +21,7 @@ restore_on_start = true
 settle_delay = 10
 
 # Skip restore-on-start when more than this many windows already exist,
-# counted before include/exclude rules.
+# counted after include/exclude rules.
 max_preexisting_windows = 3
 
 # Call notify-send after a manual or automatic restore. Dry-run does not.

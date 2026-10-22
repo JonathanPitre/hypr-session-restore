@@ -1919,7 +1919,7 @@ fn validate_window(window: &WindowEntry) -> Result<()> {
         shell_words(profile)?;
     }
     let launch_argv = shell_words(&window.launch_cmd)?;
-    if window.launch_cmd.is_empty() {
+    if window.launch_cmd.trim().is_empty() {
         bail!("empty launch command for '{}'", window.app_id);
     }
     if launch_argv.first().is_some_and(String::is_empty) {
@@ -2429,6 +2429,13 @@ mod tests {
         let window = make_entry("firefox", "firefox", Some("'-P"), None);
         let err = validate_window(&window).unwrap_err();
         assert!(err.to_string().contains("unclosed quote"), "{err}");
+    }
+
+    #[test]
+    fn validate_window_rejects_whitespace_only_launch_command() {
+        let window = make_entry("empty", "   ", None, None);
+        let err = validate_window(&window).unwrap_err();
+        assert!(err.to_string().contains("empty launch command"), "{err}");
     }
 
     #[test]

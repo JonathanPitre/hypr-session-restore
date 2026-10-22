@@ -27,7 +27,7 @@ fn validate_window_count(count: usize) -> Result<()> {
     Ok(())
 }
 
-/// `^[A-Za-z0-9][A-Za-z0-9._ -]{0,127}$`, and `..` is rejected.
+/// `^[A-Za-z0-9][A-Za-z0-9._ -]{0,127}$`, with `..` and trailing dots rejected.
 fn sanitize_session_name(name: &str) -> Result<&str> {
     let mut chars = name.chars();
     let Some(first) = chars.next() else {
@@ -45,7 +45,7 @@ fn sanitize_session_name(name: &str) -> Result<&str> {
             bail!("invalid session name '{name}'");
         }
     }
-    if name.contains("..") {
+    if name.contains("..") || name.ends_with('.') {
         bail!("invalid session name '{name}'");
     }
     Ok(name)
@@ -834,6 +834,18 @@ mod tests {
         validate_window_count(MAX_WINDOWS).unwrap();
         let err = validate_window_count(MAX_WINDOWS + 1).unwrap_err();
         assert!(err.to_string().contains("limit is 512"), "{err}");
+    }
+
+    #[test]
+    fn save_rejects_session_name_ending_in_dot() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = SnapshotEngine::new_with_dir(dir.path(), false).unwrap();
+        let state = make_state_with_windows(vec![("0xa", "firefox", "1", false)]);
+        let err = engine.save(&state, "a.").unwrap_err();
+        assert!(
+            err.to_string().contains("invalid session name 'a.'"),
+            "{err}"
+        );
     }
 
     #[test]
