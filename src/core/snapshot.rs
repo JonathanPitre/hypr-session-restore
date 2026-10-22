@@ -215,29 +215,17 @@ impl SnapshotEngine {
             .with_context(|| format!("reading session dir {}", self.dir.path().display()))?;
 
         for name in names {
-            if name.starts_with('.')
-                || !Path::new(&name)
-                    .extension()
-                    .is_some_and(|ext| ext.eq_ignore_ascii_case("toml"))
-            {
-                continue;
-            }
-            let Some(stem) = Path::new(&name).file_stem().and_then(|stem| stem.to_str()) else {
+            let Some(stem) = name.strip_suffix(".toml") else {
                 continue;
             };
-            let Ok(Some(bytes)) = self.dir.read_regular(&name) else {
+            let Ok(session) = self.load(stem) else {
                 continue;
             };
-            let Ok(content) = String::from_utf8(bytes) else {
-                continue;
-            };
-            if let Ok(session) = toml::from_str::<SessionFile>(&content) {
-                sessions.push(SessionSummary {
-                    name: stem.to_string(),
-                    timestamp: session.session.timestamp,
-                    pinned: pinned.as_deref() == Some(stem),
-                });
-            }
+            sessions.push(SessionSummary {
+                name: stem.to_string(),
+                timestamp: session.session.timestamp,
+                pinned: pinned.as_deref() == Some(stem),
+            });
         }
 
         sessions.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
@@ -783,6 +771,30 @@ mod tests {
 
         let target = engine.resolve_restore_target(None).unwrap();
         assert_eq!(target, "copy");
+        assert_eq!(engine.load(&target).unwrap().session.name, "original");
+    }
+
+    #[test]
+    fn restore_fallback_ignores_unloadable_filenames() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = SnapshotEngine::new_with_dir(dir.path(), false).unwrap();
+        std::fs::write(
+            dir.path().join("original.toml"),
+            "[session]\nname = \"original\"\ntimestamp = 1000\n",
+        )
+        .unwrap();
+        for leaf in ["copy!.toml", "copy.TOML"] {
+            std::fs::write(
+                dir.path().join(leaf),
+                "[session]\nname = \"newer\"\ntimestamp = 2000\n",
+            )
+            .unwrap();
+        }
+
+        assert_eq!(engine.list().unwrap().len(), 1);
+        let engine = SnapshotEngine::new_with_dir(dir.path(), false).unwrap();
+        let target = engine.resolve_restore_target(None).unwrap();
+        assert_eq!(target, "original");
         assert_eq!(engine.load(&target).unwrap().session.name, "original");
     }
 
