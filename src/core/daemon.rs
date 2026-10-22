@@ -207,6 +207,11 @@ async fn maybe_auto_restore(
             tracing::warn!(app_id, reason = %err, "skipping invalid saved window");
         }
         tracing::warn!("auto-restore skipped, no valid saved windows");
+        crate::core::notify::notify_outcome(
+            config.general.notify,
+            false,
+            &format!("session '{}'", plan.name),
+        );
         return Ok(());
     }
     if let Err(reason) = plan.burn() {

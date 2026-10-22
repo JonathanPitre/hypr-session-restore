@@ -36,6 +36,12 @@ def mixed_saved_clients():
     return [client("0x1", "good"), invalid]
 
 
+def invalid_saved_clients():
+    invalid = client("0x1", "invalid")
+    invalid["launch_cmd"] = "invalid'"
+    return [invalid]
+
+
 class FakeHypr:
     def __init__(self, root, clients):
         self.clients = clients
@@ -337,6 +343,14 @@ async def auto_partial_restore(binary, root):
         await h.stop()
 
 
+async def auto_all_invalid_restore(binary, root):
+    async with harness(binary, root, [], seed=invalid_saved_clients(), restore=True, notify=True) as h:
+        assert any("auto-restore skipped, no valid saved windows" in line for line in h.logs)
+        assert h.notifications.exists(), "all-invalid auto-restore did not notify"
+        assert "Session restore failed" in h.notifications.read_text().splitlines()
+        await h.stop()
+
+
 async def pending_open(binary, root, failure):
     async with harness(binary, root, [], period=1) as h:
         h.ipc_failure = failure
@@ -473,7 +487,7 @@ async def main():
     binary = Path(sys.argv[1] if len(sys.argv) > 1 else "target/debug/hypr-persist").resolve()
     cases = [normal_events, reduced_events, startup_closes, startup_partial,
              startup_periodic, startup_explicit, ipc_errors, restored_burst,
-             manual_partial_restore, auto_partial_restore,
+             manual_partial_restore, auto_partial_restore, auto_all_invalid_restore,
              pending_open_absent, pending_open_query_error, pending_open_geometry,
              pending_open_closed, pending_open_refresh_errors, startup_filtered_helper,
              startup_dedup, startup_unreadable_pin, startup_filtered_periodic, written_filtered_baseline,
