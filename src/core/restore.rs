@@ -241,9 +241,13 @@ impl RestoreEngine {
         ctl: &HyprCtl,
         live_windows: Vec<TrackedWindow>,
     ) -> Result<(RestoreReport, Option<JoinHandle<()>>)> {
+        let total = session.windows.len();
         let (windows, skipped) = partition_windows(session);
+        let mut report = RestoreReport::default();
         for (app_id, err) in skipped {
             tracing::warn!(app_id, reason = %err, "skipping invalid saved window");
+            report.failed += 1;
+            report.errors.push((app_id.to_string(), err.to_string()));
         }
         if windows.is_empty() {
             validate_session(session)?;
@@ -253,8 +257,6 @@ impl RestoreEngine {
             windows: windows.into_iter().cloned().collect(),
         };
         let mut live_pool = LiveWindowPool::new(live_windows);
-        let mut report = RestoreReport::default();
-        let total = session.windows.len();
         tracing::info!(
             "restoring session '{}' ({total} apps)",
             session.session.name

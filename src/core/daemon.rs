@@ -202,17 +202,13 @@ async fn maybe_auto_restore(
         return Ok(());
     };
     let (windows, skipped) = partition_windows(&plan.session);
-    for (app_id, err) in skipped {
-        tracing::warn!(app_id, reason = %err, "skipping invalid saved window");
-    }
     if windows.is_empty() {
+        for (app_id, err) in skipped {
+            tracing::warn!(app_id, reason = %err, "skipping invalid saved window");
+        }
         tracing::warn!("auto-restore skipped, no valid saved windows");
         return Ok(());
     }
-    let session = crate::models::SessionFile {
-        session: plan.session.session.clone(),
-        windows: windows.into_iter().cloned().collect(),
-    };
     if let Err(reason) = plan.burn() {
         tracing::warn!("auto-restore skipped: {reason:?}");
         return Ok(());
@@ -231,7 +227,7 @@ async fn maybe_auto_restore(
         config.general.restore_geometry,
         config.general.restore_layout,
     );
-    let (report, _watcher) = match engine.restore(&session, ctl, live_windows).await {
+    let (report, _watcher) = match engine.restore(&plan.session, ctl, live_windows).await {
         Ok(result) => result,
         Err(err) => {
             crate::core::notify::notify_outcome(config.general.notify, false, &err.to_string());

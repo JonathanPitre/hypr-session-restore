@@ -30,6 +30,12 @@ def six_clients():
     return [client(f"0x{i + 1:x}", f"app{i}") for i in range(6)]
 
 
+def mixed_saved_clients():
+    invalid = client("0x2", "invalid")
+    invalid["launch_cmd"] = "invalid'"
+    return [client("0x1", "good"), invalid]
+
+
 class FakeHypr:
     def __init__(self, root, clients):
         self.clients = clients
@@ -38,14 +44,16 @@ class FakeHypr:
         self.condition = asyncio.Condition()
         self.ipc_failure = None
         self.snapshot = root / "state" / "sessions" / "last.toml"
+        self.notifications = root / "notifications"
 
     def seed(self, clients):
         self.snapshot.parent.mkdir(parents=True, exist_ok=True)
         content = '[session]\nname = "last"\ntimestamp = 1\n'
         for window in clients:
             app_id = window["class"]
+            launch_cmd = window.get("launch_cmd", app_id)
             content += (
-                f'\n[[window]]\napp_id = "{app_id}"\nlaunch_cmd = "{app_id}"\n'
+                f'\n[[window]]\napp_id = "{app_id}"\nlaunch_cmd = "{launch_cmd}"\n'
                 'workspace = "1"\nmonitor = "TEST"\nfloating = false\nfullscreen = false\n'
             )
         self.snapshot.write_text(content)
@@ -122,7 +130,7 @@ class FakeHypr:
 
 @asynccontextmanager
 async def harness(binary, root, clients, *, seed=None, period=60, restore=False,
-                  per_window=True, commands=None, pin_mode=None):
+                  per_window=True, commands=None, pin_mode=None, notify=False):
     root.mkdir()
     h = FakeHypr(root, clients)
     if seed is not None:
@@ -135,21 +143,32 @@ async def harness(binary, root, clients, *, seed=None, period=60, restore=False,
     sockets.mkdir(parents=True)
     ipc = await asyncio.start_unix_server(h.request, sockets / ".socket.sock")
     events = await asyncio.start_unix_server(h.subscribe, sockets / ".socket2.sock")
-    config = root / "config.toml"
+    h.config = root / "config.toml"
     overrides = {w["class"]: w["class"] for w in clients + (seed or [])}
     overrides.update(base="base", telegram="telegram-desktop", x="brave --app=https://x.com/")
     overrides.update(commands or {})
-    config.write_text(
+    h.config.write_text(
         f'[general]\nsession_dir = "{root}/state"\n'
-        f'restore_on_start = {str(restore).lower()}\nnotify = false\nsave_interval = {period}\n'
+        f'restore_on_start = {str(restore).lower()}\n'
+        f'notify = {str(notify).lower()}\nsave_interval = {period}\n'
         f'per_window_launch = {str(per_window).lower()}\n'
         'settle_delay = 2\nrestore_layout = false\nrestore_geometry = false\n'
         '[overrides]\n' + "".join(f'{key} = "{value}"\n' for key, value in overrides.items())
     )
+    h.env = {**os.environ, "XDG_RUNTIME_DIR": str(root), "HYPRLAND_INSTANCE_SIGNATURE": "test",
+             "RUST_LOG": "hypr_persist=trace"}
+    if notify:
+        bin_dir = root / "bin"
+        bin_dir.mkdir()
+        notifier = bin_dir / "notify-send"
+        notifier.write_text(
+            '#!/bin/sh\nprintf \'%s\\n\' "$@" >> "$HYPR_PERSIST_TEST_NOTIFICATIONS"\n'
+        )
+        notifier.chmod(0o700)
+        h.env.update(PATH=f"{bin_dir}:{os.environ.get('PATH', os.defpath)}",
+                     HYPR_PERSIST_TEST_NOTIFICATIONS=str(h.notifications))
     h.daemon = await asyncio.create_subprocess_exec(
-        str(binary), "-vvv", "--config", str(config),
-        env={**os.environ, "XDG_RUNTIME_DIR": str(root), "HYPRLAND_INSTANCE_SIGNATURE": "test",
-             "RUST_LOG": "hypr_persist=trace"},
+        str(binary), "-vvv", "--config", str(h.config), env=h.env,
         stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE,
     )
     logger = asyncio.create_task(h.read_logs())
@@ -289,6 +308,35 @@ async def restored_burst(binary, root):
         await h.stop()
 
 
+async def manual_partial_restore(binary, root):
+    async with harness(binary, root, [], seed=mixed_saved_clients(), notify=True) as h:
+        process = await asyncio.create_subprocess_exec(
+            str(binary), "--config", str(h.config), "restore", env=h.env,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        )
+        try:
+            stdout, stderr = await process.communicate()
+        finally:
+            if process.returncode is None:
+                process.kill()
+                await process.wait()
+        assert process.returncode == 0, stderr.decode()
+        assert "Restored 1/2 apps (1 failed)" in stdout.decode(), stdout.decode()
+        assert "invalid: unclosed quote" in stderr.decode(), stderr.decode()
+        assert {window["class"] for window in h.clients} == {"good"}
+        assert "Session restore failed" in h.notifications.read_text().splitlines()
+        await h.stop()
+
+
+async def auto_partial_restore(binary, root):
+    async with harness(binary, root, [], seed=mixed_saved_clients(), restore=True, notify=True) as h:
+        assert {window["class"] for window in h.clients} == {"good"}
+        assert any("restore complete: 1/2 apps (1 failed, 0 pending)" in line for line in h.logs)
+        assert any("restore failed for invalid: unclosed quote" in line for line in h.logs)
+        assert "Session restore failed" in h.notifications.read_text().splitlines()
+        await h.stop()
+
+
 async def pending_open(binary, root, failure):
     async with harness(binary, root, [], period=1) as h:
         h.ipc_failure = failure
@@ -425,6 +473,7 @@ async def main():
     binary = Path(sys.argv[1] if len(sys.argv) > 1 else "target/debug/hypr-persist").resolve()
     cases = [normal_events, reduced_events, startup_closes, startup_partial,
              startup_periodic, startup_explicit, ipc_errors, restored_burst,
+             manual_partial_restore, auto_partial_restore,
              pending_open_absent, pending_open_query_error, pending_open_geometry,
              pending_open_closed, pending_open_refresh_errors, startup_filtered_helper,
              startup_dedup, startup_unreadable_pin, startup_filtered_periodic, written_filtered_baseline,
