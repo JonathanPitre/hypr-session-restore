@@ -157,6 +157,10 @@ impl SnapshotEngine {
         Ok(final_path)
     }
 
+    pub const fn per_window_launch(&self) -> bool {
+        self.per_window_launch
+    }
+
     pub fn capture_windows<'a>(&self, state: &'a StateManager) -> Vec<&'a TrackedWindow> {
         let mut seen = std::collections::HashSet::new();
         state

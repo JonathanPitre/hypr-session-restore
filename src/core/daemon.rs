@@ -324,13 +324,26 @@ async fn current_stamps(
     snapshot
         .capture_windows(&state)
         .into_iter()
-        .map(stamp_window)
+        .map(|window| stamp_window(window, snapshot.per_window_launch()))
         .collect()
 }
 
-fn stamp_window(window: &TrackedWindow) -> WindowStamp {
+fn stamp_window(window: &TrackedWindow, per_window_launch: bool) -> WindowStamp {
+    let address = normalize_address(&window.address);
+    let identity = if per_window_launch {
+        address.clone()
+    } else {
+        format!(
+            "{}:{}:{}:{}",
+            window.app_id.len(),
+            window.app_id,
+            window.profile.is_some(),
+            window.profile.as_deref().unwrap_or_default()
+        )
+    };
     WindowStamp {
-        address: normalize_address(&window.address),
+        address,
+        identity,
         workspace: window.workspace.clone(),
         monitor: window.monitor.clone(),
         floating: window.floating,
@@ -363,7 +376,7 @@ async fn save_with_refresh(
     let stamps = snapshot
         .capture_windows(&state)
         .into_iter()
-        .map(stamp_window)
+        .map(|window| stamp_window(window, snapshot.per_window_launch()))
         .collect::<Vec<_>>();
     if stamps.is_empty() {
         return false;
@@ -599,6 +612,32 @@ mod tests {
         assert_eq!(super::startup_saved_count(&snapshot, &target), None);
     }
 
+    #[test]
+    fn stamp_identity_matches_capture_mode_and_profile_presence() {
+        let window = tracked("0x1", "1", false);
+        let mut sibling = tracked("0x2", "1", false);
+        assert_eq!(super::stamp_window(&window, true).identity, "1");
+        assert_ne!(
+            super::stamp_window(&window, true).identity,
+            super::stamp_window(&sibling, true).identity
+        );
+        assert_eq!(
+            super::stamp_window(&window, false).identity,
+            super::stamp_window(&sibling, false).identity
+        );
+        sibling.profile = Some(String::new());
+        assert_ne!(
+            super::stamp_window(&window, false).identity,
+            super::stamp_window(&sibling, false).identity
+        );
+        sibling.profile = None;
+        sibling.app_id = "other".to_string();
+        assert_ne!(
+            super::stamp_window(&window, false).identity,
+            super::stamp_window(&sibling, false).identity
+        );
+    }
+
     struct SaveHarness {
         _dir: tempfile::TempDir,
         state: Arc<Mutex<StateManager>>,
@@ -636,7 +675,7 @@ mod tests {
                 state
                     .windows()
                     .into_iter()
-                    .map(super::stamp_window)
+                    .map(|window| super::stamp_window(window, true))
                     .collect(),
                 None,
             );

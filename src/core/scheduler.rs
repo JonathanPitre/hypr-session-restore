@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WindowStamp {
     pub address: String,
+    pub identity: String,
     pub workspace: String,
     pub monitor: String,
     pub floating: bool,
@@ -32,21 +33,24 @@ pub enum SaveReason {
 #[derive(Debug, Default)]
 pub struct SaveHistory {
     pub observed: Option<Vec<WindowStamp>>,
-    protected_addresses: Option<HashSet<String>>,
+    protected_identities: Option<HashSet<String>>,
     startup_saved_count: Option<usize>,
 }
 
 impl SaveHistory {
     pub fn new(initial: Vec<WindowStamp>, startup_saved_count: Option<usize>) -> Self {
         Self {
-            protected_addresses: Some(initial.iter().map(|stamp| stamp.address.clone()).collect()),
+            protected_identities: Some(
+                initial.iter().map(|stamp| stamp.identity.clone()).collect(),
+            ),
             observed: Some(initial),
             startup_saved_count,
         }
     }
 
     pub fn record_save(&mut self, stamps: Vec<WindowStamp>) {
-        self.protected_addresses = Some(stamps.iter().map(|stamp| stamp.address.clone()).collect());
+        self.protected_identities =
+            Some(stamps.iter().map(|stamp| stamp.identity.clone()).collect());
         self.observed = Some(stamps);
         self.startup_saved_count = None;
     }
@@ -57,9 +61,9 @@ impl SaveHistory {
 
     pub fn shutdown_would_shrink(&self, current: &[WindowStamp]) -> bool {
         self.startup_would_shrink(current.len())
-            || self.protected_addresses.as_ref().is_some_and(|saved| {
+            || self.protected_identities.as_ref().is_some_and(|saved| {
                 current.len() < saved.len()
-                    && current.iter().all(|stamp| saved.contains(&stamp.address))
+                    && current.iter().all(|stamp| saved.contains(&stamp.identity))
             })
     }
 }
@@ -79,7 +83,7 @@ pub enum Tick {
 
 /// `None` previous is the first tick and is always [`Delta::Material`].
 ///
-/// [`Delta::VanishOnly`] means at least one previous address is gone and none
+/// [`Delta::VanishOnly`] means at least one previous identity is gone and none
 /// were added. Surviving windows may have reflowed as their neighbours closed.
 pub fn classify(previous: Option<&[WindowStamp]>, current: &[WindowStamp]) -> Delta {
     let Some(previous) = previous else {
@@ -87,18 +91,18 @@ pub fn classify(previous: Option<&[WindowStamp]>, current: &[WindowStamp]) -> De
     };
     let mut prior = HashMap::<&str, &WindowStamp>::new();
     for stamp in previous {
-        prior.insert(stamp.address.as_str(), stamp);
+        prior.insert(stamp.identity.as_str(), stamp);
     }
     let mut seen = HashSet::<&str>::new();
     let mut changed = false;
     for stamp in current {
-        let Some(old) = prior.get(stamp.address.as_str()) else {
+        let Some(old) = prior.get(stamp.identity.as_str()) else {
             return Delta::Added;
         };
         changed |= *old != stamp;
-        seen.insert(stamp.address.as_str());
+        seen.insert(stamp.identity.as_str());
     }
-    if prior.keys().any(|address| !seen.contains(address)) {
+    if prior.keys().any(|identity| !seen.contains(identity)) {
         Delta::VanishOnly
     } else if changed {
         Delta::Material
@@ -151,6 +155,7 @@ mod tests {
     fn stamp(address: &str, workspace: &str) -> WindowStamp {
         WindowStamp {
             address: address.to_string(),
+            identity: address.to_string(),
             workspace: workspace.to_string(),
             monitor: "DP-1".to_string(),
             floating: false,
@@ -165,6 +170,35 @@ mod tests {
             delay: Duration::from_secs(10),
             deadline: None,
         }
+    }
+
+    #[test]
+    fn representative_flip_does_not_add_an_identity() {
+        let mut previous = vec![stamp("a", "1"), stamp("c", "1")];
+        previous[0].identity = "X".to_string();
+        previous[1].identity = "Y".to_string();
+        let mut current = previous.clone();
+        current[0].address = "b".to_string();
+        assert_eq!(classify(Some(&previous), &current), Delta::Material);
+    }
+
+    #[test]
+    fn shutdown_subset_survives_a_representative_flip() {
+        let mut saved = vec![stamp("a", "1"), stamp("c", "1")];
+        saved[0].identity = "X".to_string();
+        saved[1].identity = "Y".to_string();
+        let mut current = saved[0].clone();
+        current.address = "b".to_string();
+        let history = SaveHistory::new(saved, None);
+        assert!(history.shutdown_would_shrink(&[current]));
+    }
+
+    #[test]
+    fn address_identity_still_classifies_a_replacement_as_added() {
+        let previous = vec![stamp("a", "1"), stamp("c", "1")];
+        let current = vec![stamp("b", "1"), stamp("c", "1")];
+        assert_eq!(classify(Some(&previous), &current), Delta::Added);
+        assert!(!SaveHistory::new(previous, None).shutdown_would_shrink(&current[..1]));
     }
 
     #[test]
