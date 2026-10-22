@@ -122,11 +122,15 @@ class FakeHypr:
 
 @asynccontextmanager
 async def harness(binary, root, clients, *, seed=None, period=60, restore=False,
-                  per_window=True, commands=None):
+                  per_window=True, commands=None, pin_mode=None):
     root.mkdir()
     h = FakeHypr(root, clients)
     if seed is not None:
         h.seed(seed)
+    if pin_mode is not None:
+        pin = h.snapshot.parent / ".pin"
+        pin.write_text("last\n")
+        pin.chmod(pin_mode)
     sockets = root / "hypr" / "test"
     sockets.mkdir(parents=True)
     ipc = await asyncio.start_unix_server(h.request, sockets / ".socket.sock")
@@ -371,6 +375,18 @@ async def startup_dedup(binary, root):
         assert h.snapshot.read_bytes() == original, "duplicate windows masked a missing saved app"
 
 
+async def startup_unreadable_pin(binary, root):
+    root.mkdir()
+    for restore in (False, True):
+        async with harness(binary, root / str(restore), six_clients(), seed=six_clients(),
+                           restore=restore, pin_mode=0) as h:
+            original = h.snapshot.read_bytes()
+            assert any("failed to resolve startup save target" in line for line in h.logs)
+            await h.stop()
+            assert h.snapshot.read_bytes() == original, "unreadable pin changed the saved session"
+            assert (h.snapshot.parent / ".pin").stat().st_mode & 0o777 == 0
+
+
 async def startup_filtered_periodic(binary, root):
     clients = [client("0x1", "app0"), client("0x2", "helper")]
     async with harness(binary, root, clients, seed=six_clients()[:2], period=1,
@@ -411,7 +427,7 @@ async def main():
              startup_periodic, startup_explicit, ipc_errors, restored_burst,
              pending_open_absent, pending_open_query_error, pending_open_geometry,
              pending_open_closed, pending_open_refresh_errors, startup_filtered_helper,
-             startup_dedup, startup_filtered_periodic, written_filtered_baseline,
+             startup_dedup, startup_unreadable_pin, startup_filtered_periodic, written_filtered_baseline,
              written_dedup_baseline]
     selected = set(sys.argv[2:])
     with tempfile.TemporaryDirectory(prefix="event-save-") as directory:

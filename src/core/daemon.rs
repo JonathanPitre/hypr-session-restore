@@ -45,8 +45,7 @@ pub async fn run(config: Config) -> Result<()> {
         delay: Duration::from_secs(config.general.settle_delay),
         deadline: None,
     };
-    let target = snapshot.save_target(None)?;
-    let startup_saved_count = startup_saved_count(&snapshot, &target);
+    let startup_saved_count = startup_saved_count(&snapshot);
     let mut history =
         SaveHistory::new(current_stamps(&state, &snapshot).await, startup_saved_count);
     let mut next_wake = std::time::Instant::now() + save_interval;
@@ -119,11 +118,18 @@ pub async fn run(config: Config) -> Result<()> {
     Ok(())
 }
 
-fn startup_saved_count(snapshot: &SnapshotEngine, target: &str) -> Option<usize> {
-    if !snapshot.exists(target) {
+fn startup_saved_count(snapshot: &SnapshotEngine) -> Option<usize> {
+    let target = match snapshot.save_target(None) {
+        Ok(target) => target,
+        Err(err) => {
+            tracing::warn!("failed to resolve startup save target: {err:#}");
+            return None;
+        }
+    };
+    if !snapshot.exists(&target) {
         return None;
     }
-    match snapshot.load(target) {
+    match snapshot.load(&target) {
         Ok(session) => Some(session.windows.len()),
         Err(err) => {
             tracing::warn!("failed to load startup save target '{target}': {err}");
@@ -617,8 +623,7 @@ mod tests {
         let snapshot = SnapshotEngine::new_with_dir(dir.path(), true).unwrap();
         std::fs::write(dir.path().join("last.toml"), "[broken").unwrap();
 
-        let target = snapshot.save_target(None).unwrap();
-        assert_eq!(super::startup_saved_count(&snapshot, &target), None);
+        assert_eq!(super::startup_saved_count(&snapshot), None);
     }
 
     #[test]
