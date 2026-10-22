@@ -20,6 +20,13 @@ pub struct SessionSummary {
     pub pinned: bool,
 }
 
+fn validate_window_count(count: usize) -> Result<()> {
+    if count > MAX_WINDOWS {
+        bail!("session has {count} windows (limit is {MAX_WINDOWS})");
+    }
+    Ok(())
+}
+
 /// `^[A-Za-z0-9][A-Za-z0-9._ -]{0,127}$`, and `..` is rejected.
 fn sanitize_session_name(name: &str) -> Result<&str> {
     let mut chars = name.chars();
@@ -120,10 +127,13 @@ impl SnapshotEngine {
         if count == 0 {
             bail!("refusing to save an empty capture");
         }
-        if count > MAX_WINDOWS {
-            bail!("refusing to save {count} windows (limit is {MAX_WINDOWS})");
-        }
+        validate_window_count(count)?;
         let eligible = self.capture_windows(state);
+        if eligible.is_empty() {
+            bail!(
+                "refusing to save an empty capture: no tracked window had a resolvable launch command"
+            );
+        }
 
         let cwds = resolve_cwds_for_windows(&eligible);
         let entries: Vec<WindowEntry> = eligible
@@ -191,6 +201,7 @@ impl SnapshotEngine {
             .with_context(|| format!("session file {} is not utf-8", path.display()))?;
         let session: SessionFile =
             toml::from_str(&content).with_context(|| format!("parsing {}", path.display()))?;
+        validate_window_count(session.windows.len())?;
         Ok(session)
     }
 
@@ -591,7 +602,7 @@ mod tests {
     }
 
     #[test]
-    fn save_skips_empty_launch_cmd() {
+    fn save_refuses_capture_without_resolvable_launch_commands() {
         let dir = tempfile::tempdir().unwrap();
         let engine = SnapshotEngine::new_with_dir(dir.path(), false).unwrap();
 
@@ -612,9 +623,13 @@ mod tests {
             profile: None,
         });
 
-        engine.save(&state, "empty").unwrap();
-        let loaded = engine.load("empty").unwrap();
-        assert_eq!(loaded.windows.len(), 0);
+        let err = engine.save(&state, "empty").unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("no tracked window had a resolvable launch command"),
+            "{err}"
+        );
+        assert!(!engine.exists("empty"));
     }
 
     #[test]
@@ -812,6 +827,13 @@ mod tests {
 
         let result = engine.load("nonexistent");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn loaded_session_window_count_is_bounded() {
+        validate_window_count(MAX_WINDOWS).unwrap();
+        let err = validate_window_count(MAX_WINDOWS + 1).unwrap_err();
+        assert!(err.to_string().contains("limit is 512"), "{err}");
     }
 
     #[test]
