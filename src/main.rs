@@ -374,8 +374,9 @@ async fn cmd_status(cfg: &config::Config) -> Result<()> {
     }
 
     let snapshot = core::snapshot::SnapshotEngine::new(cfg)?;
-    if snapshot.exists("last") {
-        match snapshot.load("last") {
+    let target = snapshot.save_target(None)?;
+    if snapshot.exists(&target) {
+        match snapshot.load(&target) {
             Ok(session) => {
                 let dt = chrono::DateTime::from_timestamp(session.session.timestamp, 0)
                     .map_or_else(
@@ -383,11 +384,11 @@ async fn cmd_status(cfg: &config::Config) -> Result<()> {
                         |d| d.format("%Y-%m-%d %H:%M:%S").to_string(),
                     );
                 println!(
-                    "Last session: {} apps, saved at {dt}",
+                    "Saved session '{target}': {} apps, saved at {dt}",
                     session.windows.len()
                 );
             }
-            Err(e) => println!("Last session: error reading ({e})"),
+            Err(e) => println!("Saved session '{target}': error reading ({e})"),
         }
     } else {
         println!("No saved session.");

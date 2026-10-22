@@ -4,7 +4,9 @@
 /// Commands that need Hyprland are expected to fail gracefully.
 #[cfg(test)]
 mod tests {
+    use std::io::{Read, Write};
     use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::net::UnixListener;
     use std::process::Command;
 
     fn cargo_bin() -> Command {
@@ -397,6 +399,70 @@ mod tests {
         assert_eq!(stdout.trim(), "Deleted session 'nonexistent'.");
         assert!(stderr.contains("not found"), "{stderr}");
         assert!(!stdout.contains("not found"), "{stdout}");
+    }
+
+    #[test]
+    fn cli_status_reads_pinned_session_without_last() {
+        let dir = tempfile::tempdir().unwrap();
+        let session_dir = dir.path().join("sessions");
+        std::fs::create_dir_all(&session_dir).unwrap();
+        std::fs::write(
+            session_dir.join("work.toml"),
+            "[session]\nname = \"work\"\ntimestamp = 1700000000\n\n[[window]]\napp_id = \"foot\"\nlaunch_cmd = \"foot\"\nworkspace = \"1\"\n",
+        )
+        .unwrap();
+        let config_path = dir.path().join("test.toml");
+        std::fs::write(
+            &config_path,
+            format!("[general]\nsession_dir = \"{}\"\n", dir.path().display()),
+        )
+        .unwrap();
+        let cfg = config_path.to_str().unwrap();
+        let pinned = cargo_bin()
+            .args(["--config", cfg, "pin", "work"])
+            .output()
+            .unwrap();
+        assert!(pinned.status.success());
+        assert!(!session_dir.join("last.toml").exists());
+
+        let runtime = dir.path().join("runtime");
+        let socket_dir = runtime.join("hypr/status-test");
+        std::fs::create_dir_all(&socket_dir).unwrap();
+        let listener = UnixListener::bind(socket_dir.join(".socket.sock")).unwrap();
+        let server = std::thread::spawn(move || {
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = String::new();
+                stream.read_to_string(&mut request).unwrap();
+                assert_eq!(request, "j/clients");
+                stream.write_all(b"[]").unwrap();
+            }
+        });
+        let text = cargo_bin()
+            .env("XDG_RUNTIME_DIR", &runtime)
+            .env("HYPRLAND_INSTANCE_SIGNATURE", "status-test")
+            .args(["--config", cfg, "status"])
+            .output()
+            .unwrap();
+        assert!(text.status.success());
+        let stdout = String::from_utf8(text.stdout).unwrap();
+        assert!(stdout.contains("Saved session 'work': 1 apps"), "{stdout}");
+        assert!(!stdout.contains("No saved session."), "{stdout}");
+
+        let json = cargo_bin()
+            .env("XDG_RUNTIME_DIR", &runtime)
+            .env("HYPRLAND_INSTANCE_SIGNATURE", "status-test")
+            .args(["--config", cfg, "status", "--json"])
+            .output()
+            .unwrap();
+        assert!(json.status.success());
+        let value: serde_json::Value = serde_json::from_slice(&json.stdout).unwrap();
+        assert_eq!(value["pin"], "work");
+        assert_eq!(value["latest"]["name"], "work");
+        assert_eq!(value["latest"]["windows"], 1);
+        assert_eq!(value["latest"]["pinned"], true);
+        assert!(!session_dir.join("last.toml").exists());
+        server.join().unwrap();
     }
 
     #[test]
