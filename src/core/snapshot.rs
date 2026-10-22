@@ -273,12 +273,24 @@ impl SnapshotEngine {
         let Some(bytes) = self.dir.read_regular(PIN_LEAF)? else {
             return Ok(None);
         };
-        let text = String::from_utf8(bytes).context("pin file is not utf-8")?;
+        let text = match String::from_utf8(bytes) {
+            Ok(text) => text,
+            Err(err) => {
+                tracing::warn!("ignoring invalid pin: {err}");
+                return Ok(None);
+            }
+        };
         let name = text.strip_suffix('\n').unwrap_or(&text);
         if name.is_empty() {
             return Ok(None);
         }
-        Ok(Some(sanitize_session_name(name)?.to_string()))
+        match sanitize_session_name(name) {
+            Ok(name) => Ok(Some(name.to_string())),
+            Err(err) => {
+                tracing::warn!("ignoring invalid pin: {err}");
+                Ok(None)
+            }
+        }
     }
 
     /// `Some(name)` must exist. `None` is the pin, or the newest session.
@@ -338,6 +350,16 @@ impl SnapshotEngine {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn invalid_pin_is_unset() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = SnapshotEngine::new_with_dir(dir.path(), false).unwrap();
+        for content in [b"../invalid\n".as_slice(), b"work\nextra", b"\xff"] {
+            std::fs::write(dir.path().join(".pin"), content).unwrap();
+            assert_eq!(engine.pinned_name().unwrap(), None);
+        }
+    }
+
     use super::*;
     use crate::config::Config;
 

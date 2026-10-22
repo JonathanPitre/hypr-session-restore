@@ -46,11 +46,7 @@ pub async fn run(config: Config) -> Result<()> {
         deadline: None,
     };
     let target = snapshot.save_target(None)?;
-    let startup_saved_count = if snapshot.exists(&target) {
-        Some(snapshot.load(&target)?.windows.len())
-    } else {
-        None
-    };
+    let startup_saved_count = startup_saved_count(&snapshot, &target);
     let mut history =
         SaveHistory::new(current_stamps(&state, &snapshot).await, startup_saved_count);
     let mut next_wake = std::time::Instant::now() + save_interval;
@@ -121,6 +117,19 @@ pub async fn run(config: Config) -> Result<()> {
     event_handle.abort();
     tracing::info!("daemon stopped");
     Ok(())
+}
+
+fn startup_saved_count(snapshot: &SnapshotEngine, target: &str) -> Option<usize> {
+    if !snapshot.exists(target) {
+        return None;
+    }
+    match snapshot.load(target) {
+        Ok(session) => Some(session.windows.len()),
+        Err(err) => {
+            tracing::warn!("failed to load startup save target '{target}': {err}");
+            None
+        }
+    }
 }
 
 async fn maybe_auto_restore(
@@ -578,6 +587,16 @@ mod tests {
             pid: 0,
             profile: None,
         }
+    }
+
+    #[test]
+    fn corrupt_startup_save_has_no_saved_count() {
+        let dir = tempfile::tempdir().unwrap();
+        let snapshot = SnapshotEngine::new_with_dir(dir.path(), true).unwrap();
+        std::fs::write(dir.path().join("last.toml"), "[broken").unwrap();
+
+        let target = snapshot.save_target(None).unwrap();
+        assert_eq!(super::startup_saved_count(&snapshot, &target), None);
     }
 
     struct SaveHarness {
