@@ -247,8 +247,13 @@ fn cmd_list(cfg: &config::Config) -> Result<()> {
         println!("No saved sessions.");
     } else {
         println!("{:<20} {:<24} ", "NAME", "SAVED AT");
-        for (name, ts) in sessions {
-            let dt = chrono::DateTime::from_timestamp(ts, 0).map_or_else(
+        for session in sessions {
+            let name = if session.pinned {
+                format!("* {}", session.name)
+            } else {
+                session.name
+            };
+            let dt = chrono::DateTime::from_timestamp(session.timestamp, 0).map_or_else(
                 || "unknown".to_string(),
                 |d| d.format("%Y-%m-%d %H:%M:%S").to_string(),
             );
@@ -312,13 +317,13 @@ async fn cmd_status_json(cfg: &config::Config) -> Result<()> {
     };
     let snapshot = core::snapshot::SnapshotEngine::new(cfg)?;
     let latest = snapshot.list().ok().and_then(|rows| {
-        let (raw_name, saved_at) = rows.into_iter().next()?;
-        let name = raw_name.strip_prefix("* ").unwrap_or(&raw_name).to_string();
-        let windows = snapshot.load(&name).ok()?.windows.len();
+        let session = rows.into_iter().next()?;
+        let windows = snapshot.load(&session.name).ok()?.windows.len();
         Some(serde_json::json!({
-            "name": name,
-            "savedAt": saved_at,
+            "name": session.name,
+            "savedAt": session.timestamp,
             "windows": windows,
+            "pinned": session.pinned,
         }))
     });
     let pin = snapshot.pinned_name().ok().flatten();

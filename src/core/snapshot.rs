@@ -14,6 +14,12 @@ pub struct SnapshotEngine {
     per_window_launch: bool,
 }
 
+pub struct SessionSummary {
+    pub name: String,
+    pub timestamp: i64,
+    pub pinned: bool,
+}
+
 /// `^[A-Za-z0-9][A-Za-z0-9._ -]{0,127}$`, and `..` is rejected.
 fn sanitize_session_name(name: &str) -> Result<&str> {
     let mut chars = name.chars();
@@ -188,7 +194,7 @@ impl SnapshotEngine {
         Ok(session)
     }
 
-    pub fn list(&self) -> Result<Vec<(String, i64)>> {
+    pub fn list(&self) -> Result<Vec<SessionSummary>> {
         let pinned = self.pinned_name().ok().flatten();
         let mut sessions = Vec::new();
 
@@ -205,6 +211,9 @@ impl SnapshotEngine {
             {
                 continue;
             }
+            let Some(stem) = Path::new(&name).file_stem().and_then(|stem| stem.to_str()) else {
+                continue;
+            };
             let Ok(Some(bytes)) = self.dir.read_regular(&name) else {
                 continue;
             };
@@ -212,17 +221,15 @@ impl SnapshotEngine {
                 continue;
             };
             if let Ok(session) = toml::from_str::<SessionFile>(&content) {
-                let raw_name = session.session.name;
-                let label = if pinned.as_deref() == Some(raw_name.as_str()) {
-                    format!("* {raw_name}")
-                } else {
-                    raw_name
-                };
-                sessions.push((label, session.session.timestamp));
+                sessions.push(SessionSummary {
+                    name: stem.to_string(),
+                    timestamp: session.session.timestamp,
+                    pinned: pinned.as_deref() == Some(stem),
+                });
             }
         }
 
-        sessions.sort_by(|a, b| b.1.cmp(&a.1));
+        sessions.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
         Ok(sessions)
     }
 
@@ -318,7 +325,7 @@ impl SnapshotEngine {
         self.list()?
             .into_iter()
             .next()
-            .map(|(name, _)| name)
+            .map(|session| session.name)
             .context("no saved session")
     }
 
@@ -736,8 +743,8 @@ mod tests {
 
         let sessions = engine.list().unwrap();
         assert_eq!(sessions.len(), 2);
-        assert_eq!(sessions[0].0, "second");
-        assert_eq!(sessions[1].0, "first");
+        assert_eq!(sessions[0].name, "second");
+        assert_eq!(sessions[1].name, "first");
     }
 
     #[test]
@@ -747,6 +754,40 @@ mod tests {
 
         let sessions = engine.list().unwrap();
         assert!(sessions.is_empty());
+    }
+
+    #[test]
+    fn restore_fallback_uses_file_stem_instead_of_embedded_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = SnapshotEngine::new_with_dir(dir.path(), false).unwrap();
+        std::fs::write(
+            dir.path().join("copy.toml"),
+            "[session]\nname = \"original\"\ntimestamp = 1000\n",
+        )
+        .unwrap();
+
+        let target = engine.resolve_restore_target(None).unwrap();
+        assert_eq!(target, "copy");
+        assert_eq!(engine.load(&target).unwrap().session.name, "original");
+    }
+
+    #[test]
+    fn copied_session_is_listed_and_pinned_by_its_own_stem() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = SnapshotEngine::new_with_dir(dir.path(), false).unwrap();
+        let state = make_state_with_windows(vec![("0xa", "firefox", "1", false)]);
+        let original = engine.save(&state, "original").unwrap();
+        std::fs::copy(original, dir.path().join("copy.toml")).unwrap();
+        engine.pin("copy").unwrap();
+
+        let sessions = engine.list().unwrap();
+        assert_eq!(sessions.len(), 2);
+        assert!(sessions.iter().any(|row| row.name == "copy" && row.pinned));
+        assert!(
+            sessions
+                .iter()
+                .any(|row| row.name == "original" && !row.pinned)
+        );
     }
 
     #[test]
@@ -761,7 +802,7 @@ mod tests {
 
         let sessions = engine.list().unwrap();
         assert_eq!(sessions.len(), 1);
-        assert_eq!(sessions[0].0, "visible");
+        assert_eq!(sessions[0].name, "visible");
     }
 
     #[test]
@@ -888,7 +929,7 @@ mod tests {
         assert_eq!(engine.load("work").unwrap().windows.len(), 2);
         let listed = engine.list().unwrap();
         assert_eq!(listed.len(), 1);
-        assert_eq!(listed[0].0, "work");
+        assert_eq!(listed[0].name, "work");
     }
 
     #[test]
@@ -902,7 +943,9 @@ mod tests {
         assert!(engine.pin("missing").is_err());
         engine.pin("work").unwrap();
         assert_eq!(engine.pinned_name().unwrap().as_deref(), Some("work"));
-        assert_eq!(engine.list().unwrap()[0].0, "* work");
+        let sessions = engine.list().unwrap();
+        assert_eq!(sessions[0].name, "work");
+        assert!(sessions[0].pinned);
 
         engine.delete("work").unwrap();
         assert!(!engine.exists("work"));

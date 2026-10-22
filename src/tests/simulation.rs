@@ -343,7 +343,7 @@ mod tests {
 
         let sessions = snapshot.list().unwrap();
         assert_eq!(sessions.len(), 2);
-        let names: Vec<&str> = sessions.iter().map(|s| s.0.as_str()).collect();
+        let names: Vec<&str> = sessions.iter().map(|s| s.name.as_str()).collect();
         assert!(names.contains(&"work"));
         assert!(names.contains(&"gaming"));
 
