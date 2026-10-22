@@ -14,3 +14,7 @@ lint:
 .PHONY: test
 test:
 	cargo nextest run --all
+
+.PHONY: test-events
+test-events: build
+	python3 scripts/test-event-save.py

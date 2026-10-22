@@ -119,6 +119,7 @@ Build and test:
 ```sh
 make build      # dev build
 make test       # run all tests
+make test-events # event/save regression harness with fake IPC
 make lint       # clippy (pedantic)
 make format     # rustfmt
 ```
