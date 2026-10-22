@@ -234,13 +234,24 @@ impl RestoreEngine {
         self
     }
 
+    #[allow(clippy::too_many_lines)]
     pub async fn restore(
         &self,
         session: &SessionFile,
         ctl: &HyprCtl,
         live_windows: Vec<TrackedWindow>,
     ) -> Result<(RestoreReport, Option<JoinHandle<()>>)> {
-        validate_session(session)?;
+        let (windows, skipped) = partition_windows(session);
+        for (app_id, err) in skipped {
+            tracing::warn!(app_id, reason = %err, "skipping invalid saved window");
+        }
+        if windows.is_empty() {
+            validate_session(session)?;
+        }
+        let session = &SessionFile {
+            session: session.session.clone(),
+            windows: windows.into_iter().cloned().collect(),
+        };
         let mut live_pool = LiveWindowPool::new(live_windows);
         let mut report = RestoreReport::default();
         let total = session.windows.len();
@@ -1885,6 +1896,18 @@ pub fn validate_session(session: &SessionFile) -> Result<()> {
     session.windows.iter().try_for_each(validate_window)
 }
 
+pub fn partition_windows(session: &SessionFile) -> (Vec<&WindowEntry>, Vec<(&str, anyhow::Error)>) {
+    let mut valid = Vec::new();
+    let mut skipped = Vec::new();
+    for window in &session.windows {
+        match validate_window(window) {
+            Ok(()) => valid.push(window),
+            Err(err) => skipped.push((window.app_id.as_str(), err)),
+        }
+    }
+    (valid, skipped)
+}
+
 fn validate_window(window: &WindowEntry) -> Result<()> {
     crate::core::quote::reject_control_bytes(&window.app_id)?;
     crate::core::quote::reject_control_bytes(&window.launch_cmd)?;
@@ -1911,10 +1934,13 @@ fn validate_window(window: &WindowEntry) -> Result<()> {
 
 /// Launch and monitor-bind lines for a session, using the same constructors as restore.
 pub fn plan_restore(session: &SessionFile) -> Result<Vec<String>> {
-    validate_session(session)?;
-    let mut lines = Vec::new();
+    let (windows, skipped) = partition_windows(session);
+    let mut lines: Vec<_> = skipped
+        .into_iter()
+        .map(|(app_id, err)| format!("# skipped: {app_id}: {err}"))
+        .collect();
     let mut bound = HashSet::new();
-    for window in &session.windows {
+    for window in &windows {
         if let Some(monitor) = window.monitor.as_deref().filter(|name| !name.is_empty()) {
             let key = (window.workspace.clone(), monitor.to_string());
             if bound.insert(key) {
@@ -1922,7 +1948,7 @@ pub fn plan_restore(session: &SessionFile) -> Result<Vec<String>> {
             }
         }
     }
-    for window in &session.windows {
+    for window in windows {
         let launch = build_launch_cmd(window)?;
         lines.push(exec_on_workspace(&window.workspace, &launch)?);
     }
@@ -2237,6 +2263,54 @@ mod tests {
             },
             windows: vec![window],
         }
+    }
+
+    #[test]
+    fn plan_restore_skips_bad_launch_and_legacy_profile_before_valid_plan() {
+        let mut session = session_of(make_entry("good", "good", None, None));
+        session.windows.extend([
+            make_entry("bad-launch", "app'", None, None),
+            make_entry("bad-profile", "firefox", Some("-P Bob's"), None),
+        ]);
+        let lines = plan_restore(&session).unwrap();
+        assert!(lines[0].starts_with("# skipped: bad-launch:"), "{lines:?}");
+        assert!(lines[1].starts_with("# skipped: bad-profile:"), "{lines:?}");
+        assert_eq!(lines.len(), 3);
+        assert_eq!(lines[2], "exec [workspace 1 silent] good");
+    }
+
+    #[test]
+    fn partition_keeps_valid_windows_and_reports_invalid_rows() {
+        let mut session = session_of(make_entry("good", "good", None, None));
+        session.windows.extend([
+            make_entry("bad-launch", "app'", None, None),
+            make_entry("bad-profile", "firefox", Some("-P Bob's"), None),
+        ]);
+        let (valid, skipped) = partition_windows(&session);
+        assert_eq!(valid.len(), 1);
+        assert_eq!(valid[0].app_id, "good");
+        assert_eq!(skipped.len(), 2);
+        assert_eq!(skipped[0].0, "bad-launch");
+        assert_eq!(skipped[1].0, "bad-profile");
+        assert!(
+            skipped
+                .iter()
+                .all(|(_, err)| err.to_string().contains("unclosed quote"))
+        );
+        assert!(validate_session(&session).is_err());
+    }
+
+    #[tokio::test]
+    async fn restore_rejects_session_without_valid_windows_before_ipc() {
+        let session = session_of(make_entry("bad", "app'", None, None));
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("missing.sock");
+        let ctl = HyprCtl::new(HyprSocketPaths::new(socket.clone(), socket));
+        let result = RestoreEngine::new(false, false)
+            .restore(&session, &ctl, Vec::new())
+            .await;
+        let err = result.unwrap_err();
+        assert!(err.to_string().contains("unclosed quote"), "{err}");
     }
 
     #[test]

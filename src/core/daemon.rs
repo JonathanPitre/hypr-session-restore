@@ -7,7 +7,7 @@ use std::time::Duration;
 use tokio::sync::{Mutex, mpsc};
 
 use crate::config::Config;
-use crate::core::restore::{RestoreEngine, validate_session};
+use crate::core::restore::{RestoreEngine, partition_windows};
 use crate::core::scheduler::{
     Delta, SaveHistory, SaveReason, SettleState, Tick, WindowStamp, classify, on_tick,
 };
@@ -132,6 +132,7 @@ fn startup_saved_count(snapshot: &SnapshotEngine, target: &str) -> Option<usize>
     }
 }
 
+#[allow(clippy::too_many_lines)]
 async fn maybe_auto_restore(
     config: &Config,
     snapshot: &SnapshotEngine,
@@ -194,10 +195,18 @@ async fn maybe_auto_restore(
         tracing::info!("auto-restore skipped: {reason:?}");
         return Ok(());
     };
-    if let Err(err) = validate_session(&plan.session) {
-        tracing::warn!("auto-restore skipped, session rejected: {err}");
+    let (windows, skipped) = partition_windows(&plan.session);
+    for (app_id, err) in skipped {
+        tracing::warn!(app_id, reason = %err, "skipping invalid saved window");
+    }
+    if windows.is_empty() {
+        tracing::warn!("auto-restore skipped, no valid saved windows");
         return Ok(());
     }
+    let session = crate::models::SessionFile {
+        session: plan.session.session.clone(),
+        windows: windows.into_iter().cloned().collect(),
+    };
     if let Err(reason) = plan.burn() {
         tracing::warn!("auto-restore skipped: {reason:?}");
         return Ok(());
@@ -216,7 +225,7 @@ async fn maybe_auto_restore(
         config.general.restore_geometry,
         config.general.restore_layout,
     );
-    let (report, _watcher) = match engine.restore(&plan.session, ctl, live_windows).await {
+    let (report, _watcher) = match engine.restore(&session, ctl, live_windows).await {
         Ok(result) => result,
         Err(err) => {
             crate::core::notify::notify_outcome(config.general.notify, false, &err.to_string());

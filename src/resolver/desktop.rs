@@ -168,7 +168,7 @@ pub fn parse_desktop_content(content: &str, path: &Path) -> Option<DesktopEntry>
 /// Re-quote a cleaned Exec line so `shell_words` returns the same elements.
 fn quote_stored_exec(exec: &str) -> String {
     let Ok(words) = shell_words(exec) else {
-        return exec.to_string();
+        return shell_quote(exec);
     };
     words
         .iter()
@@ -241,6 +241,12 @@ pub fn exec_basename_of(exec: &str) -> Option<String> {
 mod tests {
     use super::*;
     use std::io::Write;
+
+    #[test]
+    fn stored_exec_with_literal_apostrophe_is_one_shell_word() {
+        let exec = "/opt/GRMDB/app/O'Brien";
+        assert_eq!(shell_words(&quote_stored_exec(exec)).unwrap(), [exec]);
+    }
 
     // --- clean_exec_line ---
 
