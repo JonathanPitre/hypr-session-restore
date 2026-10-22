@@ -37,9 +37,22 @@ def mixed_saved_clients():
 
 
 def invalid_saved_clients():
-    invalid = client("0x1", "invalid")
-    invalid["launch_cmd"] = "invalid'"
-    return [invalid]
+    invalid_app = client("0x1", "control-app\n\x1b[31m")
+    invalid_app["launch_cmd"] = "control-app"
+    invalid_workspace = client("0x2", "bad-workspace")
+    invalid_workspace["saved_workspace"] = "bad-workspace\n\x1b[31m"
+    return [invalid_app, invalid_workspace]
+
+
+def control_saved_clients():
+    return [client("0x1", "good"), *invalid_saved_clients()]
+
+
+def assert_session_controls_are_escaped(output):
+    assert "control-app\n\x1b[31m" not in output, output
+    assert "bad-workspace\n\x1b[31m" not in output, output
+    assert r"control-app\n\u{1b}[31m" in output, output
+    assert r"bad-workspace\n\u{1b}[31m" in output, output
 
 
 class FakeHypr:
@@ -59,8 +72,10 @@ class FakeHypr:
             app_id = window["class"]
             launch_cmd = window.get("launch_cmd", app_id)
             content += (
-                f'\n[[window]]\napp_id = "{app_id}"\nlaunch_cmd = "{launch_cmd}"\n'
-                'workspace = "1"\nmonitor = "TEST"\nfloating = false\nfullscreen = false\n'
+                f'\n[[window]]\napp_id = {json.dumps(app_id)}\n'
+                f'launch_cmd = {json.dumps(launch_cmd)}\n'
+                f'workspace = {json.dumps(window.get("saved_workspace", "1"))}\n'
+                'monitor = "TEST"\nfloating = false\nfullscreen = false\n'
             )
         self.snapshot.write_text(content)
 
@@ -154,12 +169,13 @@ async def harness(binary, root, clients, *, seed=None, period=60, restore=False,
     overrides.update(base="base", telegram="telegram-desktop", x="brave --app=https://x.com/")
     overrides.update(commands or {})
     h.config.write_text(
-        f'[general]\nsession_dir = "{root}/state"\n'
+        f'[general]\nsession_dir = {json.dumps(str(root / "state"))}\n'
         f'restore_on_start = {str(restore).lower()}\n'
         f'notify = {str(notify).lower()}\nsave_interval = {period}\n'
         f'per_window_launch = {str(per_window).lower()}\n'
         'settle_delay = 2\nrestore_layout = false\nrestore_geometry = false\n'
-        '[overrides]\n' + "".join(f'{key} = "{value}"\n' for key, value in overrides.items())
+        '[overrides]\n'
+        + "".join(f'{json.dumps(key)} = {json.dumps(value)}\n' for key, value in overrides.items())
     )
     h.env = {**os.environ, "XDG_RUNTIME_DIR": str(root), "HYPRLAND_INSTANCE_SIGNATURE": "test",
              "RUST_LOG": "hypr_persist=trace"}
@@ -328,9 +344,22 @@ async def manual_partial_restore(binary, root):
                 await process.wait()
         assert process.returncode == 0, stderr.decode()
         assert "Restored 1/2 apps (1 failed)" in stdout.decode(), stdout.decode()
-        assert "invalid: unclosed quote" in stderr.decode(), stderr.decode()
+        assert '"invalid": "unclosed quote' in stderr.decode(), stderr.decode()
         assert {window["class"] for window in h.clients} == {"good"}
         assert "Session restore failed" in h.notifications.read_text().splitlines()
+        await h.stop()
+
+
+async def manual_control_output(binary, root):
+    async with harness(binary, root, [], seed=control_saved_clients(), notify=True) as h:
+        process = await asyncio.create_subprocess_exec(
+            str(binary), "--config", str(h.config), "restore", env=h.env,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await process.communicate()
+        assert process.returncode == 0, stderr.decode()
+        assert "Restored 1/3 apps (2 failed)" in stdout.decode(), stdout.decode()
+        assert_session_controls_are_escaped(stderr.decode())
         await h.stop()
 
 
@@ -338,7 +367,7 @@ async def auto_partial_restore(binary, root):
     async with harness(binary, root, [], seed=mixed_saved_clients(), restore=True, notify=True) as h:
         assert {window["class"] for window in h.clients} == {"good"}
         assert any("restore complete: 1/2 apps (1 failed, 0 pending)" in line for line in h.logs)
-        assert any("restore failed for invalid: unclosed quote" in line for line in h.logs)
+        assert any('restore failed for "invalid": "unclosed quote' in line for line in h.logs)
         assert "Session restore failed" in h.notifications.read_text().splitlines()
         await h.stop()
 
@@ -346,7 +375,16 @@ async def auto_partial_restore(binary, root):
 async def auto_all_invalid_restore(binary, root):
     async with harness(binary, root, [], seed=invalid_saved_clients(), restore=True, notify=True) as h:
         assert any("auto-restore skipped, no valid saved windows" in line for line in h.logs)
+        assert_session_controls_are_escaped("".join(h.logs))
         assert h.notifications.exists(), "all-invalid auto-restore did not notify"
+        assert "Session restore failed" in h.notifications.read_text().splitlines()
+        await h.stop()
+
+
+async def auto_control_output(binary, root):
+    async with harness(binary, root, [], seed=control_saved_clients(), restore=True, notify=True) as h:
+        assert {window["class"] for window in h.clients} == {"good"}
+        assert_session_controls_are_escaped("".join(h.logs))
         assert "Session restore failed" in h.notifications.read_text().splitlines()
         await h.stop()
 
@@ -487,7 +525,8 @@ async def main():
     binary = Path(sys.argv[1] if len(sys.argv) > 1 else "target/debug/hypr-persist").resolve()
     cases = [normal_events, reduced_events, startup_closes, startup_partial,
              startup_periodic, startup_explicit, ipc_errors, restored_burst,
-             manual_partial_restore, auto_partial_restore, auto_all_invalid_restore,
+             manual_partial_restore, manual_control_output, auto_partial_restore,
+             auto_all_invalid_restore, auto_control_output,
              pending_open_absent, pending_open_query_error, pending_open_geometry,
              pending_open_closed, pending_open_refresh_errors, startup_filtered_helper,
              startup_dedup, startup_unreadable_pin, startup_filtered_periodic, written_filtered_baseline,

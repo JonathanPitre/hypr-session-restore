@@ -204,7 +204,11 @@ async fn maybe_auto_restore(
     let (windows, skipped) = partition_windows(&plan.session);
     if windows.is_empty() {
         for (app_id, err) in skipped {
-            tracing::warn!(app_id, reason = %err, "skipping invalid saved window");
+            tracing::warn!(
+                app_id = ?app_id,
+                reason = ?err.to_string(),
+                "skipping invalid saved window"
+            );
         }
         tracing::warn!("auto-restore skipped, no valid saved windows");
         crate::core::notify::notify_outcome(
@@ -244,7 +248,7 @@ async fn maybe_auto_restore(
         .context("reconciling live state after auto-restore")?;
     if report.failed > 0 {
         for (app, err) in &report.errors {
-            tracing::warn!("restore failed for {app}: {err}");
+            tracing::warn!("restore failed for {app:?}: {err:?}");
         }
     }
     crate::core::notify::notify_outcome(

@@ -229,7 +229,7 @@ async fn cmd_restore(cfg: &config::Config, name: Option<&str>, dry_run: bool) ->
         }
     );
     for (app, err) in &report.errors {
-        eprintln!("  {app}: {err}");
+        eprintln!("  {app:?}: {err:?}");
     }
 
     if let Some(handle) = watcher {

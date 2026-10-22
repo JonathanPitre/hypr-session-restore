@@ -245,7 +245,11 @@ impl RestoreEngine {
         let (windows, skipped) = partition_windows(session);
         let mut report = RestoreReport::default();
         for (app_id, err) in skipped {
-            tracing::warn!(app_id, reason = %err, "skipping invalid saved window");
+            tracing::warn!(
+                app_id = ?app_id,
+                reason = ?err.to_string(),
+                "skipping invalid saved window"
+            );
             report.failed += 1;
             report.errors.push((app_id.to_string(), err.to_string()));
         }
