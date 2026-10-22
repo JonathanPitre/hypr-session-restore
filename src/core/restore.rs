@@ -1943,7 +1943,7 @@ pub fn plan_restore(session: &SessionFile) -> Result<Vec<String>> {
     let (windows, skipped) = partition_windows(session);
     let mut lines: Vec<_> = skipped
         .into_iter()
-        .map(|(app_id, err)| format!("# skipped: {app_id}: {err}"))
+        .map(|(app_id, err)| format!("# skipped: {app_id:?}: {err:?}"))
         .collect();
     let mut bound = HashSet::new();
     for window in &windows {
@@ -2275,12 +2275,18 @@ mod tests {
     fn plan_restore_skips_bad_launch_and_legacy_profile_before_valid_plan() {
         let mut session = session_of(make_entry("good", "good", None, None));
         session.windows.extend([
-            make_entry("bad-launch", "app'", None, None),
+            make_entry("bad\n\u{1b}[31m", "app'", None, None),
             make_entry("bad-profile", "firefox", Some("-P Bob's"), None),
         ]);
         let lines = plan_restore(&session).unwrap();
-        assert!(lines[0].starts_with("# skipped: bad-launch:"), "{lines:?}");
-        assert!(lines[1].starts_with("# skipped: bad-profile:"), "{lines:?}");
+        assert!(
+            lines[0].starts_with("# skipped: \"bad\\n\\u{1b}[31m\":"),
+            "{lines:?}"
+        );
+        assert!(
+            lines[1].starts_with("# skipped: \"bad-profile\":"),
+            "{lines:?}"
+        );
         assert_eq!(lines.len(), 3);
         assert_eq!(lines[2], "exec [workspace 1 silent] good");
     }
@@ -2298,11 +2304,8 @@ mod tests {
         assert_eq!(skipped.len(), 2);
         assert_eq!(skipped[0].0, "bad-launch");
         assert_eq!(skipped[1].0, "bad-profile");
-        assert!(
-            skipped
-                .iter()
-                .all(|(_, err)| err.to_string().contains("unclosed quote"))
-        );
+        assert!(skipped[0].1.to_string().contains("unclosed quote"));
+        assert!(skipped[1].1.to_string().contains("unclosed quote"));
         assert!(validate_session(&session).is_err());
     }
 
