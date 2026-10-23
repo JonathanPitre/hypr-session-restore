@@ -6,7 +6,7 @@
 
 use anyhow::{Context, Result, bail};
 use std::ffi::{CStr, CString};
-use std::fs::{File, Permissions};
+use std::fs::{File, Permissions, TryLockError};
 use std::io::{Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
@@ -21,6 +21,11 @@ pub struct PrivateDir {
     file: File,
     path: PathBuf,
     readonly: bool,
+}
+
+#[derive(Debug)]
+pub struct FileLock {
+    _file: File,
 }
 
 #[derive(Debug)]
@@ -92,6 +97,41 @@ impl PrivateDir {
 
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Hold an exclusive lock until the guard is dropped, leaving `leaf` in place.
+    pub fn try_lock(&self, leaf: &str) -> Result<Option<FileLock>> {
+        if self.readonly {
+            bail!("directory {} is read-only", self.path.display());
+        }
+        validate_leaf(leaf)?;
+        let leaf_c = cstring_bytes(leaf.as_bytes()).context("file name")?;
+        let flags =
+            libc::O_RDWR | libc::O_CREAT | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC;
+        // SAFETY: `leaf_c` is a single component relative to the opened directory.
+        let fd = unsafe { libc::openat(self.dir_fd(), leaf_c.as_ptr(), flags, 0o600) };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error())
+                .with_context(|| format!("opening lock file {leaf}"));
+        }
+        // SAFETY: `fd` is a freshly opened descriptor owned exclusively here.
+        let file = unsafe { File::from_raw_fd(fd) };
+        let meta = file.metadata().with_context(|| format!("stat {leaf}"))?;
+        if !meta.is_file() {
+            bail!("refusing non-regular file {leaf}");
+        }
+        if meta.uid() != euid() {
+            bail!("refusing foreign-owned file {leaf}");
+        }
+        if (meta.mode() & 0o077) != 0 {
+            file.set_permissions(Permissions::from_mode(0o600))
+                .with_context(|| format!("repairing mode of {leaf}"))?;
+        }
+        match file.try_lock() {
+            Ok(()) => Ok(Some(FileLock { _file: file })),
+            Err(TryLockError::WouldBlock) => Ok(None),
+            Err(TryLockError::Error(err)) => Err(err).with_context(|| format!("locking {leaf}")),
+        }
     }
 
     /// Atomically replace `leaf` with `bytes`.
@@ -446,6 +486,55 @@ mod tests {
 
     fn mode_of(path: &Path) -> u32 {
         std::fs::metadata(path).unwrap().mode() & 0o777
+    }
+
+    #[test]
+    fn lock_guard_is_exclusive_and_preserves_leaf_after_drop() {
+        let (_parent, store) = writable_dir();
+        store.atomic_write("lock", b"sentinel").unwrap();
+        let path = store.path().join("lock");
+        std::fs::set_permissions(&path, Permissions::from_mode(0o644)).unwrap();
+        let inode = std::fs::metadata(&path).unwrap().ino();
+        let guard = store.try_lock("lock").unwrap().unwrap();
+        assert_eq!(mode_of(&path), 0o600);
+        let other = PrivateDir::open(store.path(), false).unwrap();
+        drop(store);
+        assert!(other.try_lock("lock").unwrap().is_none());
+        drop(guard);
+        assert_eq!(std::fs::metadata(&path).unwrap().ino(), inode);
+        assert_eq!(std::fs::read(&path).unwrap(), b"sentinel");
+        let _guard = other.try_lock("lock").unwrap().unwrap();
+        assert!(other.try_lock("lock").unwrap().is_none());
+    }
+
+    #[test]
+    fn lock_refuses_unsafe_leaves_and_readonly_directory() {
+        let (parent, store) = writable_dir();
+        let outside = parent.path().join("outside");
+        std::fs::write(&outside, b"sentinel").unwrap();
+        symlink(&outside, store.path().join("link")).unwrap();
+        assert!(store.try_lock("link").is_err());
+        assert!(store.try_lock("../outside").is_err());
+        assert_eq!(std::fs::read(&outside).unwrap(), b"sentinel");
+        std::fs::create_dir(store.path().join("dir")).unwrap();
+        assert!(store.try_lock("dir").is_err());
+        let readonly = PrivateDir::open(store.path(), true).unwrap();
+        assert!(readonly.try_lock("missing").is_err());
+        assert!(!store.path().join("missing").exists());
+    }
+
+    #[test]
+    fn lock_refuses_fifo_promptly() {
+        let (_parent, store) = writable_dir();
+        let fifo = store.path().join("pipe");
+        let c_path = CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        // SAFETY: `c_path` is a NUL-terminated path in a directory we created.
+        let rc = unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) };
+        assert_eq!(rc, 0, "{}", std::io::Error::last_os_error());
+        let started = Instant::now();
+        let err = store.try_lock("pipe").unwrap_err();
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(format!("{err:#}").contains("non-regular"), "{err:#}");
     }
 
     #[test]

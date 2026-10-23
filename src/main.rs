@@ -236,6 +236,13 @@ async fn cmd_restore(cfg: &config::Config, name: Option<&str>, dry_run: bool) ->
         println!("Waiting for slow-starting apps (up to 60s)...");
         drop(handle.await);
     }
+    if report.failed > 0 {
+        bail!(
+            "session restore failed: {} of {} apps failed",
+            report.failed,
+            report.restored + report.failed
+        );
+    }
     Ok(())
 }
 

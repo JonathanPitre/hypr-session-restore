@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use signal_hook::consts::{SIGINT, SIGTERM, SIGUSR1};
 use signal_hook_tokio::Signals;
 use std::collections::HashSet;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{Mutex, mpsc};
@@ -12,14 +13,16 @@ use crate::core::scheduler::{
     Delta, SaveHistory, SaveReason, SettleState, Tick, WindowStamp, classify, on_tick,
 };
 use crate::core::snapshot::SnapshotEngine;
-use crate::core::stamp::{AutoRestore, AutoRestoreInput, decide_auto_restore};
+use crate::core::stamp::{AutoRestore, AutoRestoreInput, InstanceKey, decide_auto_restore};
 use crate::core::state::{StateManager, normalize_address};
+use crate::core::store::{FileLock, PrivateDir};
 use crate::ipc::client::HyprCtl;
 use crate::ipc::event_listener;
 use crate::models::{HyprClient, HyprEvent, TrackedWindow};
 use crate::resolver::AppResolver;
 
 pub async fn run(config: Config) -> Result<()> {
+    let _instance_lock = lock_instance()?;
     let ctl = Arc::new(HyprCtl::from_env()?);
     let resolver = Arc::new(AppResolver::new(&config));
     let state = Arc::new(Mutex::new(StateManager::new(&config)));
@@ -118,6 +121,17 @@ pub async fn run(config: Config) -> Result<()> {
     Ok(())
 }
 
+fn lock_instance() -> Result<FileLock> {
+    let signature = std::env::var("HYPRLAND_INSTANCE_SIGNATURE")
+        .context("HYPRLAND_INSTANCE_SIGNATURE not set, is Hyprland running?")?;
+    let instance = InstanceKey::parse(&signature)
+        .map_err(|()| anyhow::anyhow!("invalid HYPRLAND_INSTANCE_SIGNATURE"))?;
+    let runtime = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/run/user/1000".into());
+    let dir = PrivateDir::open(&PathBuf::from(runtime).join("hypr-persist"), false)?;
+    dir.try_lock(&format!(".{}.lock", instance.as_str()))?
+        .with_context(|| format!("daemon already running for Hyprland instance '{signature}'"))
+}
+
 fn startup_saved_count(snapshot: &SnapshotEngine) -> Option<usize> {
     let target = match snapshot.save_target(None) {
         Ok(target) => target,
@@ -214,7 +228,7 @@ async fn maybe_auto_restore(
         crate::core::notify::notify_outcome(
             config.general.notify,
             false,
-            &format!("session '{}'", plan.name),
+            &format!("session '{}': no valid windows were restored", plan.name),
         );
         return Ok(());
     }
