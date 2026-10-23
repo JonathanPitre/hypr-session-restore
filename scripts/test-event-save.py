@@ -59,6 +59,8 @@ class FakeHypr:
     def __init__(self, root, clients):
         self.clients = clients
         self.writers = []
+        self.subscribed = asyncio.Event()
+        self.requests = []
         self.logs = []
         self.condition = asyncio.Condition()
         self.ipc_failure = None
@@ -81,6 +83,7 @@ class FakeHypr:
 
     async def request(self, reader, writer):
         command = (await reader.read()).decode()
+        self.requests.append(command)
         if command == "j/clients":
             response = json.dumps(self.clients) if self.ipc_failure != "clients" else "invalid"
         elif command == "j/monitors":
@@ -99,6 +102,7 @@ class FakeHypr:
 
     async def subscribe(self, reader, writer):
         self.writers.append(writer)
+        self.subscribed.set()
         try:
             await reader.read()
         finally:
@@ -209,6 +213,52 @@ async def harness(binary, root, clients, *, seed=None, period=60, restore=False,
         events.close()
         await ipc.wait_closed()
         await events.wait_closed()
+
+
+async def duplicate_daemon(binary, root):
+    async with harness(binary, root, six_clients()) as h:
+        await h.subscribed.wait()
+        requests = h.requests[:]
+        subscribers = len(h.writers)
+        process = await asyncio.create_subprocess_exec(
+            str(binary), "--config", str(h.config), env=h.env,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        )
+        try:
+            try:
+                stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=2)
+            except TimeoutError:
+                raise AssertionError("same-instance duplicate daemon stayed running") from None
+            assert process.returncode != 0, (stdout.decode(), stderr.decode())
+            assert "daemon already running" in stderr.decode(), stderr.decode()
+            assert h.daemon.returncode is None, "first daemon exited during duplicate start"
+            assert h.requests == requests, "duplicate daemon talked to Hyprland IPC"
+            assert len(h.writers) == subscribers, "duplicate daemon subscribed to Hyprland events"
+        finally:
+            if process.returncode is None:
+                process.kill()
+                await process.wait()
+        await h.stop()
+        process = await asyncio.create_subprocess_exec(
+            str(binary), "-vvv", "--config", str(h.config), env=h.env,
+            stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE,
+        )
+        try:
+            logs = []
+            while line := await process.stderr.readline():
+                logs.append(line.decode())
+                if "daemon running" in logs[-1]:
+                    break
+            else:
+                raise AssertionError("restart failed after first daemon exited\n" + "".join(logs))
+            assert process.returncode is None, "restarted daemon exited unexpectedly"
+            process.send_signal(signal.SIGTERM)
+            _, stderr = await process.communicate()
+            assert process.returncode == 0, stderr.decode()
+        finally:
+            if process.returncode is None:
+                process.kill()
+                await process.wait()
 
 
 async def normal_events(binary, root):
@@ -342,11 +392,12 @@ async def manual_partial_restore(binary, root):
             if process.returncode is None:
                 process.kill()
                 await process.wait()
-        assert process.returncode == 0, stderr.decode()
         assert "Restored 1/2 apps (1 failed)" in stdout.decode(), stdout.decode()
         assert '"invalid": "unclosed quote' in stderr.decode(), stderr.decode()
         assert {window["class"] for window in h.clients} == {"good"}
         assert "Session restore failed" in h.notifications.read_text().splitlines()
+        assert process.returncode != 0, "partial restore exited successfully"
+        assert "session restore failed" in stderr.decode(), stderr.decode()
         await h.stop()
 
 
@@ -357,9 +408,10 @@ async def manual_control_output(binary, root):
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
         )
         stdout, stderr = await process.communicate()
-        assert process.returncode == 0, stderr.decode()
         assert "Restored 1/3 apps (2 failed)" in stdout.decode(), stdout.decode()
         assert_session_controls_are_escaped(stderr.decode())
+        assert process.returncode != 0, "partial restore with control characters exited successfully"
+        assert "session restore failed" in stderr.decode(), stderr.decode()
         await h.stop()
 
 
@@ -378,6 +430,7 @@ async def auto_all_invalid_restore(binary, root):
         assert_session_controls_are_escaped("".join(h.logs))
         assert h.notifications.exists(), "all-invalid auto-restore did not notify"
         assert "Session restore failed" in h.notifications.read_text().splitlines()
+        assert "no valid windows were restored" in h.notifications.read_text(), h.notifications.read_text()
         await h.stop()
 
 
@@ -523,7 +576,7 @@ async def written_dedup_baseline(binary, root):
 
 async def main():
     binary = Path(sys.argv[1] if len(sys.argv) > 1 else "target/debug/hypr-persist").resolve()
-    cases = [normal_events, reduced_events, startup_closes, startup_partial,
+    cases = [duplicate_daemon, normal_events, reduced_events, startup_closes, startup_partial,
              startup_periodic, startup_explicit, ipc_errors, restored_burst,
              manual_partial_restore, manual_control_output, auto_partial_restore,
              auto_all_invalid_restore, auto_control_output,
